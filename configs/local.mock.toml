@@ -1,0 +1,49 @@
+[location]
+latitude = -17.10211
+longitude = -56.94487
+country = "BRA"
+admin1_region = "BR-MT"
+timezone = "America/Cuiaba"
+
+[storage]
+root = ".local_run/usb"
+fallback_root = ".local_run/fallback"
+state_root = ".local_run/state"
+work_root = ".local_run/work"
+recording_root = ".local_run/audio"
+logs_subdir = "."
+photos_subdir = "Photos"
+photo_date_subdirs = false
+require_usb = false
+csv_filename = "Jaguar Reserve Camera Trap.csv"
+csv_profile = "jaguar_reserve_camera_trap"
+
+[schedule]
+interval_seconds = 5
+sensor_sample_seconds = 1
+night_start_hour = 18
+night_end_hour = 6
+startup_delay_seconds = 0
+
+[camera]
+enabled = true
+scheduled_capture_times = ["09:00", "16:00"]
+
+[sensors]
+uart_co2_enabled = true
+uart_co2_device = "/dev/null"
+
+[time]
+gps_enabled = false
+rtc_write_enabled = false
+coordinate_enabled = true
+fallback_latitude = -17.10211
+fallback_longitude = -56.94487
+
+[birdnet]
+enabled = true
+python = ".venv/bin/python"
+batch_max_files = 1
+
+[drive_sync]
+enabled = false

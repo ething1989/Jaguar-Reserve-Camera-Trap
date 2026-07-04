@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Jaguar Reserve Google Drive uploader every 5 minutes
+Description=Run Juara Google Drive uploader every 5 minutes
 
 [Timer]
 OnBootSec=2min

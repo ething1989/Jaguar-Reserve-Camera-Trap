@@ -3,17 +3,21 @@ set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/juara-wildlife-station}"
 CONFIG_PATH="${CONFIG_PATH:-/etc/juara-station.toml}"
-CONFIG_TEMPLATE="${CONFIG_TEMPLATE:-configs/station.example.toml}"
 SERVICE_USER="${SERVICE_USER:-${SUDO_USER:-$(id -un)}}"
-TIMEZONE="${TIMEZONE:-America/Cuiaba}"
-USB_LABEL="${USB_LABEL:-JAGUAR-CAM}"
-USB_MOUNT="${USB_MOUNT:-/mnt/juara_usb}"
+INSTALL_AI="${INSTALL_AI:-1}"
+INSTALL_BIRDNET="${INSTALL_BIRDNET:-$INSTALL_AI}"
+INSTALL_SPECIESNET="${INSTALL_SPECIESNET:-0}"
+INSTALL_CAMERA="${INSTALL_CAMERA:-1}"
+DISABLE_BLUETOOTH_UART="${DISABLE_BLUETOOTH_UART:-0}"
+CONFIG_TEMPLATE="${CONFIG_TEMPLATE:-configs/station.pi1.example.toml}"
 AUDIO_DEVICE="${AUDIO_DEVICE:-}"
-RESET_CONFIG="${RESET_CONFIG:-1}"
-INSTALL_BIRDNET="${INSTALL_BIRDNET:-1}"
-BUILD_SPECIES_PACK="${BUILD_SPECIES_PACK:-1}"
-GDRIVE_REMOTE="${GDRIVE_REMOTE:-juara-gdrive}"
-GDRIVE_DIR="${GDRIVE_DIR:-Jaguar Reserve Camera Trap}"
+TIMEZONE="${TIMEZONE:-America/Cuiaba}"
+USB_LABEL="${USB_LABEL:-JUARA-CAM-1}"
+USB_MOUNT="${USB_MOUNT:-/mnt/juara_usb}"
+GPS_DEVICE="${GPS_DEVICE:-/dev/serial0}"
+SPECIESNET_MODEL="${SPECIESNET_MODEL:-kaggle:google/speciesnet/pyTorch/v4.0.2a/1}"
+SPECIESNET_MODEL_DIR="${SPECIESNET_MODEL_DIR:-/home/$SERVICE_USER/.cache/kagglehub/models/google/speciesnet/pyTorch/v4.0.2a/1}"
+SPECIESNET_TARGET_SPECIES_PATH="${SPECIESNET_TARGET_SPECIES_PATH:-/etc/juara-speciesnet-target-species.txt}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "Run with sudo: sudo $0"
@@ -27,6 +31,17 @@ append_once() {
   local file="$1"
   local line="$2"
   grep -qxF "$line" "$file" || printf '\n%s\n' "$line" >> "$file"
+}
+
+set_key_value() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  if grep -q "^${key}=" "$file"; then
+    sed -i "s#^${key}=.*#${key}=${value}#" "$file"
+  else
+    printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
 }
 
 set_toml_key_in_section() {
@@ -82,7 +97,45 @@ install_extra() {
   if "$VENV_PYTHON" -m pip install -e "$APP_DIR[$extra]"; then
     echo "Installed $label dependencies."
   else
-    echo "WARNING: $label dependencies failed to install; the station will keep logging and retry that work."
+    echo "WARNING: $label dependencies failed to install; the station will keep logging and retry/skip that AI work."
+  fi
+}
+
+prestage_speciesnet_model() {
+  if runuser -u "$SERVICE_USER" -- env SPECIESNET_MODEL="$SPECIESNET_MODEL" "$VENV_PYTHON" - <<'PY'
+from pathlib import Path
+import json
+import os
+from speciesnet.utils import ModelInfo
+
+info = ModelInfo(os.environ["SPECIESNET_MODEL"])
+base_dir = Path(info.classifier).parent
+required = [
+    info.classifier,
+    info.classifier_labels,
+    info.detector,
+    info.taxonomy,
+    info.geofence,
+]
+missing = [path for path in required if not Path(path).exists() or Path(path).stat().st_size == 0]
+print(f"SpeciesNet model dir: {Path(info.classifier).parent}")
+for path in required:
+    print(f"{Path(path).name}: {Path(path).stat().st_size if Path(path).exists() else 0}")
+if missing:
+    raise SystemExit("Missing SpeciesNet files: " + ", ".join(str(path) for path in missing))
+info_path = base_dir / "info.json"
+payload = json.loads(info_path.read_text())
+detector = payload.get("detector", "")
+if detector.startswith(("http://", "https://")):
+    local_detector = detector.split("?", 1)[0].replace(":", "_").replace("/", "_")
+    payload["detector"] = local_detector
+    info_path.write_text(json.dumps(payload, indent=4) + "\n")
+    print(f"Pinned SpeciesNet detector to local file: {local_detector}")
+PY
+  then
+    echo "Pre-staged SpeciesNet model files for $SERVICE_USER."
+  else
+    echo "WARNING: SpeciesNet model pre-stage failed; image AI may be disabled or try to fetch files if model_path is not set correctly."
   fi
 }
 
@@ -146,42 +199,47 @@ PY
   fi
 }
 
-echo "Installing Jaguar Reserve station on $(uname -m) with $(python3 --version 2>&1)"
-echo "Expected Wi-Fi from Raspberry Pi Imager: SSID JAGUAR LODGE, open network, no password"
+echo "Installing Juara station on $(uname -m) with $(python3 --version 2>&1)"
 
 apt-get update
-apt-get install -y \
-  alsa-utils \
-  ffmpeg \
-  i2c-tools \
-  pigpio \
-  python3-dev \
-  python3-picamera2 \
-  python3-pigpio \
-  python3-pip \
-  python3-venv \
-  python3-smbus \
-  rclone \
-  rpicam-apps \
-  rsync \
+apt_packages=(
+  alsa-utils
+  ffmpeg
+  gpsd
+  gpsd-clients
+  i2c-tools
+  pigpio
+  python3-dev
+  python3-pigpio
+  python3-pip
+  python3-venv
+  python3-smbus
+  rsync
   util-linux-extra
+)
+if [[ "$INSTALL_CAMERA" == "1" ]]; then
+  apt_packages+=(python3-picamera2 rpicam-apps)
+fi
+apt-get install -y "${apt_packages[@]}"
 
 if command -v timedatectl >/dev/null 2>&1; then
   timedatectl set-timezone "$TIMEZONE" || true
 fi
 
+# Field stations usually run offline from solar power. Disable Debian's
+# unattended apt timers so they do not burn CPU/network looking for updates.
 systemctl disable --now apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
 
 if command -v raspi-config >/dev/null 2>&1; then
   raspi-config nonint do_i2c 0 || true
-  raspi-config nonint do_serial_hw 0 || true
-  raspi-config nonint do_serial_cons 1 || true
 fi
 
 append_once /boot/firmware/config.txt "dtparam=i2c_arm=on"
 append_once /boot/firmware/config.txt "dtoverlay=i2c-rtc,ds3231"
 append_once /boot/firmware/config.txt "enable_uart=1"
-append_once /boot/firmware/config.txt "camera_auto_detect=1"
+if [[ "$DISABLE_BLUETOOTH_UART" == "1" ]]; then
+  append_once /boot/firmware/config.txt "dtoverlay=disable-bt"
+fi
 if [[ -f /boot/firmware/cmdline.txt ]]; then
   python3 - <<'PY'
 from pathlib import Path
@@ -195,6 +253,13 @@ fi
 systemctl disable --now serial-getty@serial0.service serial-getty@ttyS0.service 2>/dev/null || true
 systemctl mask serial-getty@serial0.service serial-getty@ttyS0.service 2>/dev/null || true
 systemctl enable --now pigpiod.service 2>/dev/null || systemctl enable --now pigpiod 2>/dev/null || true
+usermod -aG dialout gpsd 2>/dev/null || true
+
+if [[ -f /etc/default/gpsd ]]; then
+  set_key_value /etc/default/gpsd DEVICES "\"$GPS_DEVICE\""
+  set_key_value /etc/default/gpsd GPSD_OPTIONS "\"-n\""
+  set_key_value /etc/default/gpsd USBAUTO "\"true\""
+fi
 
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$APP_DIR"
 rsync -a --delete \
@@ -212,39 +277,70 @@ rsync -a --delete \
 python3 -m venv --system-site-packages "$APP_DIR/.venv"
 "$VENV_PYTHON" -m pip install --upgrade pip
 "$VENV_PYTHON" -m pip install -e "$APP_DIR"
-install_extra pi "Pi hardware and sensor"
+install_extra pi "Pi hardware"
 
 if [[ "$INSTALL_BIRDNET" == "1" ]]; then
   install_extra birdnet "BirdNET audio AI"
   make_module_writable birdnet_analyzer "BirdNET audio AI"
   patch_birdnet_tflite_checker
-  if [[ "$BUILD_SPECIES_PACK" == "1" && ! -d "$APP_DIR/data/BirdNET_100mi_PrimaryPlus/cells" ]]; then
-    echo "Building 100-mile BirdNET species pack. This can take a while on a Pi Zero 2 W."
-    runuser -u "$SERVICE_USER" -- "$VENV_PYTHON" "$APP_DIR/scripts/build_birdnet_100mi_species_pack.py" \
-      --output "$APP_DIR/data/BirdNET_100mi_PrimaryPlus" \
-      --threads 1 || {
-        echo "WARNING: Could not build the 100-mile BirdNET species pack; generated species filtering will retry after setup."
-      }
+  if [[ -f "$APP_DIR/data/birdnet/juara_region_species_list.txt" ]]; then
+    install -m 0644 "$APP_DIR/data/birdnet/juara_region_species_list.txt" /etc/juara-birdnet-species-list.txt
   fi
 fi
 
-if [[ "$RESET_CONFIG" == "1" || ! -f "$CONFIG_PATH" ]]; then
+if [[ "$INSTALL_SPECIESNET" == "1" ]]; then
+  install_extra speciesnet "SpeciesNet image AI"
+  if [[ -f "$APP_DIR/data/speciesnet/juara_region_target_species.txt" ]]; then
+    install -m 0644 "$APP_DIR/data/speciesnet/juara_region_target_species.txt" "$SPECIESNET_TARGET_SPECIES_PATH"
+  fi
+  prestage_speciesnet_model
+fi
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
   install -m 0644 "$APP_DIR/$CONFIG_TEMPLATE" "$CONFIG_PATH"
 fi
+set_toml_key_in_section "$CONFIG_PATH" schedule image_ai_defer_enabled "false"
+set_toml_key_in_section "$CONFIG_PATH" schedule audio_recording_disabled_start_hour "1"
+set_toml_key_in_section "$CONFIG_PATH" schedule audio_recording_disabled_end_hour "3"
+set_toml_key_in_section "$CONFIG_PATH" schedule audio_backlog_purge_hour "3"
+set_toml_key_in_section "$CONFIG_PATH" schedule post_audio_reboot_hour "3"
+set_toml_key_in_section "$CONFIG_PATH" schedule photo_capture_disabled_start_hour "19"
+set_toml_key_in_section "$CONFIG_PATH" schedule photo_capture_disabled_end_hour "6"
+set_toml_key_in_section "$CONFIG_PATH" schedule photo_processing_deadline_hour "6"
+set_toml_key_in_section "$CONFIG_PATH" camera warm_restart_interval_seconds "300"
 if [[ -n "$AUDIO_DEVICE" ]]; then
   set_toml_key_in_section "$CONFIG_PATH" audio device "\"$AUDIO_DEVICE\""
 fi
-
-install -d -o "$SERVICE_USER" -g "$SERVICE_USER" /var/lib/juara-station/state
-if [[ -f "$APP_DIR/data/birdnet/jaguar_reserve_active_species_list.txt" ]]; then
-  install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0644 \
-    "$APP_DIR/data/birdnet/jaguar_reserve_active_species_list.txt" \
-    /var/lib/juara-station/state/juara-birdnet-species-list.txt
+if [[ "$INSTALL_SPECIESNET" == "1" ]]; then
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet enabled "true"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet model_path "\"$SPECIESNET_MODEL_DIR\""
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet target_species_txt "\"$SPECIESNET_TARGET_SPECIES_PATH\""
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet run_in_station_service "false"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet classifier_only "true"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet direct_classifier "true"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet isolated_process "true"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet subprocess_timeout_seconds "240"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet subprocess_threads "1"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet subprocess_nice "15"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet subprocess_memory_limit_mb "384"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet keep_classifier_loaded "false"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet batch_size "1"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet input_size "224"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet fast_input_size "0"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet fast_accept_min_confidence "0.90"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet blank_precheck_enabled "true"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet blank_precheck_skip_classifier "true"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet min_classifier_available_memory_mb "650"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet max_photos_per_run "1"
+else
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet enabled "false"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet run_in_station_service "false"
+  set_toml_key_in_section "$CONFIG_PATH" speciesnet delete_blanks "false"
 fi
-if [[ "$INSTALL_BIRDNET" == "1" && -d "$APP_DIR/data/BirdNET_100mi_PrimaryPlus/cells" ]]; then
-  runuser -u "$SERVICE_USER" -- "$VENV_PYTHON" -m juara_station.cli --config "$CONFIG_PATH" select-species || {
-    echo "WARNING: Dynamic BirdNET species-pack selection failed; station will use the bundled fallback list and retry on next run."
-  }
+if [[ "$INSTALL_BIRDNET" == "1" ]]; then
+  set_toml_key_in_section "$CONFIG_PATH" birdnet run_in_station_service "false"
+  set_toml_key_in_section "$CONFIG_PATH" birdnet batch_max_files "1"
+  set_toml_key_in_section "$CONFIG_PATH" birdnet batch_size "1"
 fi
 
 usermod -aG audio,video,i2c,gpio,plugdev,dialout "$SERVICE_USER" || true
@@ -256,15 +352,8 @@ reboot_sudoers_file="/etc/sudoers.d/juara-station-reboot"
 printf '%s ALL=(root) NOPASSWD: /usr/sbin/reboot\n' "$SERVICE_USER" > "$reboot_sudoers_file"
 chmod 0440 "$reboot_sudoers_file"
 visudo -cf "$reboot_sudoers_file" >/dev/null
-systemctl_sudoers_file="/etc/sudoers.d/juara-station-systemctl"
-{
-  printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl stop juara-ai-worker.service\n' "$SERVICE_USER"
-  printf '%s ALL=(root) NOPASSWD: /bin/systemctl stop juara-ai-worker.service\n' "$SERVICE_USER"
-} > "$systemctl_sudoers_file"
-chmod 0440 "$systemctl_sudoers_file"
-visudo -cf "$systemctl_sudoers_file" >/dev/null
-
 install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$USB_MOUNT" /var/lib/juara-station
+
 usb_device="$(blkid -L "$USB_LABEL" 2>/dev/null || true)"
 if [[ -z "$usb_device" ]]; then
   usb_device="$(lsblk -rpno NAME,TYPE,FSTYPE | awk '$1 ~ "^/dev/sd" && $2 == "part" && $3 != "" { print $1; exit }')"
@@ -291,106 +380,43 @@ if [[ -n "$usb_device" ]]; then
     echo "WARNING: USB partition $usb_device has no UUID or filesystem type; station will use fallback storage until USB is mounted."
   fi
 else
-  user_uid="$(id -u "$SERVICE_USER")"
-  user_gid="$(id -g "$SERVICE_USER")"
-  tmp_fstab="$(mktemp)"
-  awk -v mountpoint="$USB_MOUNT" '$2 != mountpoint { print }' /etc/fstab > "$tmp_fstab"
-  cat "$tmp_fstab" > /etc/fstab
-  rm -f "$tmp_fstab"
-  printf 'LABEL=%s %s auto defaults,nofail,x-systemd.automount,x-systemd.device-timeout=10s,uid=%s,gid=%s,umask=0022 0 0\n' \
-    "$USB_LABEL" "$USB_MOUNT" "$user_uid" "$user_gid" >> /etc/fstab
-  systemctl daemon-reload
-  echo "WARNING: USB drive label $USB_LABEL not found and no USB partition was detected; installed a label-based automount entry and station will use fallback storage until USB is mounted."
+  echo "WARNING: USB drive label $USB_LABEL not found and no USB partition was detected; station will use fallback storage until USB is mounted."
 fi
 
 mkdir -p \
+  "$USB_MOUNT/juara/photos" \
+  "$USB_MOUNT/juara/logs" \
+  "$USB_MOUNT/juara/media/photos" \
   /var/lib/juara-station/state \
   /var/lib/juara-station/audio_recordings \
   /tmp/juara-ai-work \
-  /tmp/juara-audio \
-  "$USB_MOUNT/Photos"
-rm -rf "$USB_MOUNT/audio" "$USB_MOUNT/media/audio" 2>/dev/null || true
-chown -R "$SERVICE_USER:$SERVICE_USER" "$USB_MOUNT" /var/lib/juara-station /tmp/juara-ai-work /tmp/juara-audio 2>/dev/null || true
-
-cat > /usr/local/bin/juara-planned-reboot <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-APP_DIR="$APP_DIR"
-CONFIG_PATH="$CONFIG_PATH"
-VENV_PYTHON="\$APP_DIR/.venv/bin/python"
-TIMEOUT_SECONDS="\${JUARA_PLANNED_REBOOT_TIMEOUT_SECONDS:-180}"
-export APP_DIR CONFIG_PATH VENV_PYTHON
-
-cleanup() {
-  systemctl stop juara-station.service juara-ai-worker.service 2>/dev/null || true
-  "\$VENV_PYTHON" -m juara_station.cli --config "\$CONFIG_PATH" planned-reboot-cleanup || true
-}
-
-if ! timeout --kill-after=15s "\${TIMEOUT_SECONDS}s" bash -c "\$(declare -f cleanup); cleanup"; then
-  echo "WARNING: Juara planned reboot cleanup timed out after \${TIMEOUT_SECONDS}s; rebooting anyway." >&2
-fi
-
-systemctl reboot
-EOF
-chmod 0755 /usr/local/bin/juara-planned-reboot
-
-install -m 0755 "$APP_DIR/scripts/juara_gdrive_sync" /usr/local/bin/juara_gdrive_sync
-install -m 0755 "$APP_DIR/scripts/juara_gdrive_auth_helper" /usr/local/bin/juara_gdrive_auth_helper
-cat > /etc/default/juara-gdrive-sync <<EOF
-JUARA_LOCAL_ROOT=$USB_MOUNT
-JUARA_GDRIVE_REMOTE=$GDRIVE_REMOTE
-JUARA_GDRIVE_DIR=$GDRIVE_DIR
-JUARA_GDRIVE_LOG=/var/log/juara-gdrive-sync.log
-EOF
-touch /var/log/juara-gdrive-sync.log
-chown "$SERVICE_USER:$SERVICE_USER" /var/log/juara-gdrive-sync.log
+  /tmp/juara-audio
+rm -rf "$USB_MOUNT/juara/audio" "$USB_MOUNT/juara/media/audio"
+chown -R "$SERVICE_USER:$SERVICE_USER" "$USB_MOUNT/juara" /var/lib/juara-station /tmp/juara-ai-work /tmp/juara-audio 2>/dev/null || true
 
 sed "s#__USER__#$SERVICE_USER#g; s#__APP_DIR__#$APP_DIR#g; s#__CONFIG_PATH__#$CONFIG_PATH#g" \
   "$APP_DIR/systemd/juara-station.service.in" > /etc/systemd/system/juara-station.service
 sed "s#__USER__#$SERVICE_USER#g; s#__APP_DIR__#$APP_DIR#g; s#__CONFIG_PATH__#$CONFIG_PATH#g" \
   "$APP_DIR/systemd/juara-ai-worker.service.in" > /etc/systemd/system/juara-ai-worker.service
-sed "s#__USER__#$SERVICE_USER#g" \
-  "$APP_DIR/systemd/juara-gdrive-sync.service.in" > /etc/systemd/system/juara-gdrive-sync.service
-install -m 0644 "$APP_DIR/systemd/juara-gdrive-sync.timer" /etc/systemd/system/juara-gdrive-sync.timer
 install -m 0644 "$APP_DIR/systemd/juara-daily-reboot.service" /etc/systemd/system/juara-daily-reboot.service
 install -m 0644 "$APP_DIR/systemd/juara-daily-reboot.timer" /etc/systemd/system/juara-daily-reboot.timer
 
 systemctl daemon-reload
+systemctl enable gpsd.socket gpsd.service || true
+systemctl restart gpsd.socket gpsd.service || true
 systemctl enable juara-station.service
 systemctl enable juara-ai-worker.service
-systemctl enable --now juara-gdrive-sync.timer
 systemctl enable --now juara-daily-reboot.timer
 
 "$VENV_PYTHON" - <<'PY' || true
 import importlib.util
-for module in ("juara_station", "birdnet_analyzer", "picamera2", "board", "busio", "adafruit_bme280", "adafruit_veml7700", "serial", "pigpio"):
+for module in ("juara_station", "birdnet_analyzer", "speciesnet", "picamera2", "board", "busio", "adafruit_scd4x", "pms5003", "pigpio"):
     print(f"{module}={bool(importlib.util.find_spec(module))}")
 PY
 
-cat <<EOF
-
-Installed Jaguar Reserve station for user $SERVICE_USER
-Config: $CONFIG_PATH
-USB mount: $USB_MOUNT
-CSV: $USB_MOUNT/Jaguar Reserve Camera Trap.csv
-Photos: $USB_MOUNT/Photos
-Google Drive folder: $GDRIVE_REMOTE:$GDRIVE_DIR
-
-MH-Z19C default wiring:
-  Sensor TX -> Pi GPIO15/RXD0, physical pin 10
-  Sensor RX -> Pi GPIO14/TXD0, physical pin 8
-  Sensor GND -> Pi GND
-  Sensor power -> sensor-rated power input
-Use a level shifter or divider if the sensor TX line outputs 5V; Pi GPIO is 3.3V only.
-
-Google Drive still needs a human login once per Pi:
-  sudo -u "$SERVICE_USER" /usr/local/bin/juara_gdrive_auth_helper
-  sudo -u "$SERVICE_USER" rclone config reconnect "$GDRIVE_REMOTE":
-  sudo -u "$SERVICE_USER" /usr/local/bin/juara_gdrive_sync
-
-Service controls:
-  sudo systemctl start juara-station
-  sudo systemctl start juara-ai-worker
-  sudo journalctl -u juara-station -f
-EOF
+echo "Installed Juara station for user $SERVICE_USER"
+echo "Config: $CONFIG_PATH"
+echo "USB mount: $USB_MOUNT"
+echo "Start service: sudo systemctl start juara-station"
+echo "Start AI worker: sudo systemctl start juara-ai-worker"
+echo "Watch logs: sudo journalctl -u juara-station -f"

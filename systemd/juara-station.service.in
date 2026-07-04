@@ -1,6 +1,7 @@
 [Unit]
 Description=Juara autonomous wildlife monitoring station
-After=local-fs.target
+After=local-fs.target gpsd.service
+Wants=gpsd.service
 StartLimitIntervalSec=0
 
 [Service]

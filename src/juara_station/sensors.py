@@ -93,31 +93,6 @@ class SoftUartMhz19Co2:
         return None
 
 
-class SerialMhz19Co2:
-    """Read an MH-Z19C CO2 sensor on the Pi hardware UART."""
-
-    def __init__(self, device: str, baudrate: int = 9600) -> None:
-        import serial
-
-        self._serial = serial.Serial(device, baudrate=baudrate, timeout=1.5)
-
-    def close(self) -> None:
-        try:
-            self._serial.close()
-        except Exception:
-            pass
-
-    def read_ppm(self) -> int:
-        self._serial.reset_input_buffer()
-        self._serial.write(MHZ19_READ_CO2_COMMAND)
-        frame = self._serial.read(9)
-        if len(frame) != 9 or frame[0] != 0xFF or frame[1] != 0x86:
-            raise TimeoutError("no valid MH-Z19C CO2 UART response")
-        if _mhz19_checksum(frame) != frame[8]:
-            raise RuntimeError("MH-Z19C CO2 UART checksum mismatch")
-        return frame[2] * 256 + frame[3]
-
-
 @dataclass
 class SensorReadings:
     temperature_c: float | None = None
@@ -279,14 +254,11 @@ class SensorSuite:
             self._remember_error(f"I2C sensor stack unavailable: {exc}")
         if self.config.uart_co2_enabled and self._uart_co2 is None:
             try:
-                if self.config.uart_co2_device:
-                    self._uart_co2 = SerialMhz19Co2(self.config.uart_co2_device, self.config.uart_co2_baudrate)
-                else:
-                    self._uart_co2 = SoftUartMhz19Co2(
-                        rx_gpio=self.config.uart_co2_rx_gpio,
-                        tx_gpio=self.config.uart_co2_tx_gpio,
-                        baudrate=self.config.uart_co2_baudrate,
-                    )
+                self._uart_co2 = SoftUartMhz19Co2(
+                    rx_gpio=self.config.uart_co2_rx_gpio,
+                    tx_gpio=self.config.uart_co2_tx_gpio,
+                    baudrate=self.config.uart_co2_baudrate,
+                )
                 self._uart_co2_warm_until = time.monotonic() + max(0, self.config.uart_co2_warmup_seconds)
             except Exception as exc:
                 self._remember_error(f"UART CO2 init failed: {exc}")

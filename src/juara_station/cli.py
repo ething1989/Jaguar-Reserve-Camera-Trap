@@ -25,12 +25,13 @@ def main() -> None:
 
     once = sub.add_parser("once", help="Run one interval, useful for local testing.")
     once.add_argument("--duration", type=int, default=None, help="Override interval duration in seconds.")
+    once.add_argument("--simulate-motion", action="store_true", help="Create one mock/real motion capture during interval.")
     once.set_defaults(func=_once)
 
-    process = sub.add_parser("process-backlog", help="Retry pending audio AI work.")
+    process = sub.add_parser("process-backlog", help="Retry pending audio and image AI work.")
     process.set_defaults(func=_process_backlog)
 
-    ai_worker = sub.add_parser("ai-worker", help="Run the BirdNET backlog worker.")
+    ai_worker = sub.add_parser("ai-worker", help="Run the BirdNET/SpeciesNet backlog worker.")
     ai_worker.add_argument("--sleep-seconds", type=int, default=60, help="Seconds between idle AI backlog checks.")
     ai_worker.add_argument("--once", action="store_true", help="Run one AI backlog cycle and exit.")
     ai_worker.set_defaults(func=_ai_worker)
@@ -67,7 +68,7 @@ def _run(args) -> None:
 
 def _once(args) -> None:
     service = _service(args)
-    path = service.run_interval(duration_seconds=args.duration)
+    path = service.run_interval(duration_seconds=args.duration, simulate_motion=args.simulate_motion)
     print(path)
 
 
@@ -75,22 +76,23 @@ def _process_backlog(args) -> None:
     service = _service(args)
     days = set()
     days.update(service.process_audio_backlog())
+    days.update(service.process_image_backlog())
     for day in sorted(days):
         export_day_csv(
             service.store,
             service.paths.logs_dir,
             datetime.combine(day, datetime.min.time(), tzinfo=service.config.zoneinfo),
             service.config.zoneinfo,
+            include_photos=service.config.camera.enabled,
             options=service._csv_export_options(),
         )
-        service._trigger_drive_sync("manual backlog CSV export")
     print(f"processed_days={len(days)}")
 
 
 def _ai_worker(args) -> None:
     service = _service(args, ai_only=True)
     if args.once:
-        days = service.run_ai_worker_once()
+        days = service.run_ai_worker_once(manage_camera=False)
         print(f"processed_days={len(days)}")
         return
     service.run_ai_worker_forever(sleep_seconds=args.sleep_seconds)
@@ -117,6 +119,7 @@ def _export(args) -> None:
             paths.logs_dir,
             local_day,
             config.zoneinfo,
+            include_photos=config.camera.enabled,
             options=service._csv_export_options(),
         )
     )
@@ -148,7 +151,7 @@ def _select_species(args) -> None:
     longitude = args.lon if args.lon is not None else config.time.fallback_longitude
     selection = write_active_species_list(pack_root, output_path, latitude, longitude)
     print(f"species_count={selection.species_count}")
-    print("nearest_cell_count=" + str(len(selection.cell_files)))
+    print(f"region={selection.region_key or ''}")
     print("cells=" + ",".join(selection.cell_files))
     print(f"output={output_path}")
 

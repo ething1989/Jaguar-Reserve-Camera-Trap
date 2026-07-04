@@ -7,7 +7,7 @@ if [ -f /etc/default/juara-gdrive-sync ]; then
 fi
 
 REMOTE_NAME="${JUARA_GDRIVE_REMOTE:-juara-gdrive}"
-REMOTE_DIR="${JUARA_GDRIVE_DIR:-Jaguar Reserve Camera Trap}"
+REMOTE_DIR="${JUARA_GDRIVE_DIR:-Julice Station/$(hostname)}"
 
 if ! command -v rclone >/dev/null 2>&1; then
   echo "rclone is not installed"

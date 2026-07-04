@@ -30,9 +30,7 @@ run timedatectl
 section "Storage"
 run lsblk -o NAME,LABEL,UUID,FSTYPE,SIZE,MOUNTPOINTS
 run findmnt "$USB_MOUNT"
-run_shell "test -w '$USB_MOUNT' && echo usb_root_writable=yes || echo usb_root_writable=no"
-run_shell "test -d '$USB_MOUNT/Photos' && test -w '$USB_MOUNT/Photos' && echo usb_photos_dir_writable=yes || echo usb_photos_dir_writable=no"
-run_shell "test ! -d '$USB_MOUNT/media/audio' && test ! -d '$USB_MOUNT/audio' && echo usb_audio_folders_absent=yes || echo usb_audio_folders_absent=no"
+run_shell "test -w '$USB_MOUNT/juara' && echo usb_station_dir_writable=yes || echo usb_station_dir_writable=no"
 run df -h "$USB_MOUNT" /
 
 section "Boot Config"
@@ -65,6 +63,14 @@ else
   echo "hwclock is not installed."
 fi
 
+section "GPS"
+run_shell "sed -n '1,80p' /etc/default/gpsd 2>/dev/null || true"
+if command -v gpspipe >/dev/null 2>&1; then
+  run timeout 10 gpspipe -w -n 10
+else
+  echo "gpspipe is not installed."
+fi
+
 section "Audio"
 if command -v arecord >/dev/null 2>&1; then
   run arecord -l
@@ -90,45 +96,37 @@ else
 fi
 
 section "Camera"
-if command -v rpicam-hello >/dev/null 2>&1; then
-  run rpicam-hello --list-cameras
-elif command -v libcamera-hello >/dev/null 2>&1; then
-  run libcamera-hello --list-cameras
-else
-  echo "No rpicam/libcamera hello command is installed."
+camera_enabled="true"
+if [[ -f "$CONFIG_PATH" ]]; then
+  camera_enabled="$(awk '
+    $0 ~ /^\[camera\]/ { in_camera=1; next }
+    $0 ~ /^\[/ { in_camera=0 }
+    in_camera && $1 == "enabled" {
+      print $3
+      exit
+    }
+  ' "$CONFIG_PATH")"
+  camera_enabled="${camera_enabled:-true}"
 fi
-if [[ "$RUN_ACTIVE_TESTS" == "1" ]]; then
-  if command -v rpicam-still >/dev/null 2>&1; then
-    run rpicam-still -n --width 2592 --height 1944 --quality 92 -o /tmp/jaguar_camera_test.jpg
-    run ls -lh /tmp/jaguar_camera_test.jpg
-  elif command -v libcamera-still >/dev/null 2>&1; then
-    run libcamera-still -n --width 2592 --height 1944 --quality 92 -o /tmp/jaguar_camera_test.jpg
-    run ls -lh /tmp/jaguar_camera_test.jpg
+if [[ "$camera_enabled" == "false" ]]; then
+  echo "Camera disabled in config; skipping camera checks."
+else
+  if command -v rpicam-hello >/dev/null 2>&1; then
+    run rpicam-hello --list-cameras
+  elif command -v libcamera-hello >/dev/null 2>&1; then
+    run libcamera-hello --list-cameras
+  else
+    echo "No rpicam/libcamera hello command is installed."
   fi
-fi
-
-section "CO2 UART"
-run_shell "test -e /dev/serial0 && echo serial0_present=yes || echo serial0_present=no"
-if [[ "$RUN_ACTIVE_TESTS" == "1" && -x "$APP_DIR/.venv/bin/python" ]]; then
-  run_shell "'$APP_DIR/.venv/bin/python' - <<'PY'
-from juara_station.sensors import SerialMhz19Co2
-try:
-    sensor = SerialMhz19Co2('/dev/serial0', 9600)
-    try:
-        print(f'co2_ppm={sensor.read_ppm()}')
-    finally:
-        sensor.close()
-except Exception as exc:
-    print(f'co2_error={exc}')
-PY"
-fi
-
-section "Google Drive"
-if command -v rclone >/dev/null 2>&1; then
-  run rclone listremotes
-  run_shell "systemctl --no-pager --full status juara-gdrive-sync.timer 2>&1 | sed -n '1,80p' || true"
-else
-  echo "rclone is not installed."
+  if [[ "$RUN_ACTIVE_TESTS" == "1" ]]; then
+    if command -v rpicam-still >/dev/null 2>&1; then
+      run rpicam-still -n --immediate -o /tmp/juara_camera_test.jpg
+      run ls -lh /tmp/juara_camera_test.jpg
+    elif command -v libcamera-still >/dev/null 2>&1; then
+      run libcamera-still -n --immediate -o /tmp/juara_camera_test.jpg
+      run ls -lh /tmp/juara_camera_test.jpg
+    fi
+  fi
 fi
 
 section "Station Python"
@@ -136,7 +134,7 @@ if [[ -x "$APP_DIR/.venv/bin/python" ]]; then
   run "$APP_DIR/.venv/bin/python" --version
   run_shell "'$APP_DIR/.venv/bin/python' - <<'PY'
 import importlib.util
-for module in ('juara_station', 'birdnet_analyzer', 'picamera2', 'board', 'busio', 'adafruit_bme280', 'adafruit_veml7700', 'serial', 'pigpio'):
+for module in ('juara_station', 'birdnet_analyzer', 'speciesnet', 'picamera2', 'board', 'busio', 'gpiozero'):
     print(f'{module}={bool(importlib.util.find_spec(module))}')
 PY"
 else
@@ -144,11 +142,11 @@ else
 fi
 
 section "Station Service"
-run_shell "systemctl is-enabled juara-station.service juara-ai-worker.service juara-gdrive-sync.timer juara-daily-reboot.timer 2>&1 || true"
+run_shell "systemctl is-enabled juara-station.service juara-ai-worker.service juara-daily-reboot.timer gpsd.service gpsd.socket 2>&1 || true"
 run_shell "systemctl --no-pager --full status juara-station.service 2>&1 | sed -n '1,80p' || true"
 run_shell "systemctl --no-pager --full status juara-ai-worker.service 2>&1 | sed -n '1,80p' || true"
 if [[ -f "$CONFIG_PATH" ]]; then
-  run_shell "sed -n '1,240p' '$CONFIG_PATH'"
+  run_shell "sed -n '1,180p' '$CONFIG_PATH'"
 else
   echo "$CONFIG_PATH is not present yet."
 fi

@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 import csv
 
+from .acoustic_indices import ACOUSTIC_INDEX_COLUMNS
 from .paths import atomic_replace_text
 from .storage import DataStore, from_iso
 
@@ -19,8 +20,9 @@ CALL_COLUMNS = [f"Call {index}" for index in range(1, MAX_BIRD_CALL_COLUMNS + 1)
 
 @dataclass(frozen=True)
 class CsvExportOptions:
-    filename: str = "Jaguar Reserve Camera Trap.csv"
-    profile: str = "jaguar_reserve_camera_trap"
+    filename: str = "juara_station.csv"
+    profile: str = "standard"
+    include_photos: bool = True
     latitude: float | None = None
     longitude: float | None = None
     interval_seconds: int = 300
@@ -40,6 +42,7 @@ CSV_COLUMNS = [
     "particles_0_3_per_l_avg",
     "particles_0_5_per_l_avg",
     "cpu_temp_c_avg",
+    "photos_taken",
     "bird_species_richness",
     "bird_total_calls",
     "bird_total_species",
@@ -47,24 +50,24 @@ CSV_COLUMNS = [
     "bird_shannon_index",
     "bird_simpson_index",
     "bird_pielou_evenness",
+    *ACOUSTIC_INDEX_COLUMNS,
     "audio_status",
     "bird_calls_truncated",
     *CALL_COLUMNS,
 ]
 
-JAGUAR_RESERVE_COLUMNS = [
+JUNE_CAMERA_TRAP_COLUMNS = [
     "Timestamp",
     "Time_Source",
     "Pi_Event",
     "Temp",
     "Humidity",
     "Lux",
-    "CO2",
     "mmHg",
     "Pi_cpu_temp",
-    "Photos_Taken",
     "lat",
     "lon",
+    "Photos_Taken",
     "species_richness",
     "total_calls",
     "total_species",
@@ -72,6 +75,7 @@ JAGUAR_RESERVE_COLUMNS = [
     "shannon_index",
     "simpsons_index",
     "pielou_evenness",
+    *ACOUSTIC_INDEX_COLUMNS,
     "Audio_status",
     *CALL_COLUMNS,
     "",
@@ -84,41 +88,36 @@ def export_day_csv(
     logs_dir: Path,
     local_day: datetime,
     zone: ZoneInfo,
+    include_photos: bool = True,
     options: CsvExportOptions | None = None,
 ) -> Path:
-    return export_main_csv(store, logs_dir, zone, options=options)
+    return export_main_csv(store, logs_dir, zone, include_photos=include_photos, options=options)
 
 
 def export_main_csv(
     store: DataStore,
     logs_dir: Path,
     zone: ZoneInfo,
+    include_photos: bool = True,
     options: CsvExportOptions | None = None,
 ) -> Path:
-    options = options or CsvExportOptions()
+    options = options or CsvExportOptions(include_photos=include_photos)
     rows = _coalesce_event_only_rows(store.list_intervals(), options.interval_seconds)
     call_rows_by_interval = _bird_call_rows_by_interval(store)
     errors_by_interval = _errors_by_interval(store)
-    jaguar_profile = options.profile == "jaguar_reserve_camera_trap"
-    columns = list(JAGUAR_RESERVE_COLUMNS if jaguar_profile else CSV_COLUMNS)
-    photo_counts = _photo_counts_by_interval(store)
+    columns = list(JUNE_CAMERA_TRAP_COLUMNS if options.profile == "june2026trap" else CSV_COLUMNS)
+    if not options.include_photos and "photos_taken" in columns:
+        columns.remove("photos_taken")
+    if not options.include_photos and "Photos_Taken" in columns:
+        columns.remove("Photos_Taken")
     output = StringIO()
     writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
         bird_calls = call_rows_by_interval.get(row["period_start_utc"])
         interval_errors = errors_by_interval.get(row["period_start_utc"], [])
-        if jaguar_profile:
-            writer.writerow(
-                _row_to_jaguar_csv(
-                    row,
-                    zone,
-                    bird_calls,
-                    interval_errors,
-                    photo_counts.get(row["period_start_utc"], 0),
-                    options,
-                )
-            )
+        if options.profile == "june2026trap":
+            writer.writerow(_row_to_june_csv(row, zone, bird_calls, interval_errors, options))
         else:
             writer.writerow(_row_to_csv(row, zone, bird_calls))
     path = logs_dir / options.filename
@@ -186,14 +185,18 @@ def _is_event_only_row(row: dict) -> bool:
         "bird_simpson_index",
         "bird_pielou_evenness",
         "bird_call_cells",
+        *ACOUSTIC_INDEX_COLUMNS,
         "audio_path",
+        "animal_summary",
+        "camera_status",
         "notes",
     )
     if any(row.get(field) not in (None, "") for field in empty_fields):
         return False
     if row.get("audio_status") not in (None, ""):
         return False
-    return True
+    numeric_zero_fields = ("photos_taken", "photos_kept", "photos_deleted_blank")
+    return all(row.get(field) in (None, 0, "") for field in numeric_zero_fields)
 
 
 def _floor_interval_key(value: datetime, interval_seconds: int) -> str:
@@ -233,6 +236,7 @@ def _row_to_csv(row, zone: ZoneInfo, bird_calls: list[dict] | None = None) -> di
         "particles_0_3_per_l_avg": _round(row["particles_0_3_per_l_avg"]),
         "particles_0_5_per_l_avg": _round(row["particles_0_5_per_l_avg"]),
         "cpu_temp_c_avg": _round(row["cpu_temp_c_avg"]),
+        "photos_taken": "" if row["system_event"] else row["photos_taken"] or 0,
         "bird_species_richness": row["bird_species_richness"] or "",
         "bird_total_calls": row["bird_total_calls"] or "",
         "bird_total_species": row["bird_total_species"] or "",
@@ -240,6 +244,7 @@ def _row_to_csv(row, zone: ZoneInfo, bird_calls: list[dict] | None = None) -> di
         "bird_shannon_index": _round(row["bird_shannon_index"]),
         "bird_simpson_index": _round(row["bird_simpson_index"]),
         "bird_pielou_evenness": _round(row["bird_pielou_evenness"]),
+        **_acoustic_csv_values(row),
         "audio_status": row["audio_status"] or "",
         "bird_calls_truncated": "" if row["system_event"] else truncated,
     }
@@ -248,15 +253,14 @@ def _row_to_csv(row, zone: ZoneInfo, bird_calls: list[dict] | None = None) -> di
     return output
 
 
-def _row_to_jaguar_csv(
+def _row_to_june_csv(
     row,
     zone: ZoneInfo,
     bird_calls: list[dict] | None = None,
     interval_errors: list[str] | None = None,
-    photos_taken: int = 0,
     options: CsvExportOptions | None = None,
 ) -> dict[str, str | int | float | None]:
-    options = options or CsvExportOptions(profile="jaguar_reserve_camera_trap")
+    options = options or CsvExportOptions(profile="june2026trap")
     timestamp = from_iso(row["timestamp_utc"]).astimezone(zone).strftime("%m/%d/%y %H:%M.%S")
     selected_calls, _truncated = _selected_call_cells(bird_calls or [])
     errors = list(interval_errors or [])
@@ -264,17 +268,16 @@ def _row_to_jaguar_csv(
         errors.extend(str(row["notes"]).split("; "))
     output = {
         "Timestamp": timestamp,
-        "Time_Source": _jaguar_time_source(row["timestamp_source"]),
-        "Pi_Event": _jaguar_event(row["system_event"] or ""),
+        "Time_Source": _june_time_source(row["timestamp_source"]),
+        "Pi_Event": _june_event(row["system_event"] or ""),
         "Temp": _round(row["temperature_c_avg"]),
         "Humidity": _round(row["humidity_pct_avg"]),
         "Lux": _round(row["lux_avg"]),
-        "CO2": _round(row["co2_ppm_avg"]),
         "mmHg": _round(row["pressure_mmhg_avg"]),
         "Pi_cpu_temp": _round(row["cpu_temp_c_avg"]),
-        "Photos_Taken": photos_taken or "",
         "lat": _round(options.latitude),
         "lon": _round(options.longitude),
+        "Photos_Taken": "" if row["system_event"] else row["photos_taken"] or 0,
         "species_richness": row["bird_species_richness"] or "",
         "total_calls": row["bird_total_calls"] or "",
         "total_species": row["bird_total_species"] or "",
@@ -282,7 +285,8 @@ def _row_to_jaguar_csv(
         "shannon_index": _round(row["bird_shannon_index"]),
         "simpsons_index": _round(row["bird_simpson_index"]),
         "pielou_evenness": _round(row["bird_pielou_evenness"]),
-        "Audio_status": _jaguar_audio_status(row["audio_status"] or ""),
+        **_acoustic_csv_values(row),
+        "Audio_status": _june_audio_status(row["audio_status"] or ""),
         "": "",
         "Errors": "\n".join(error for error in errors if error),
     }
@@ -291,7 +295,7 @@ def _row_to_jaguar_csv(
     return output
 
 
-def _jaguar_time_source(value: str) -> str:
+def _june_time_source(value: str) -> str:
     mapping = {
         "gps": "GPS",
         "gps_rtc_corrected": "GPS",
@@ -304,10 +308,10 @@ def _jaguar_time_source(value: str) -> str:
     return mapping.get(value, value)
 
 
-def _jaguar_event(value: str) -> str:
+def _june_event(value: str) -> str:
     if ";" in value or "\n" in value:
         parts = [part.strip() for part in value.replace("\n", ";").split(";") if part.strip()]
-        return "\n".join(_jaguar_event(part) for part in parts)
+        return "\n".join(_june_event(part) for part in parts)
     mapping = {
         "STATION_STARTED": "Pi Started",
         "STATION_SERVICE_RESTARTED": "Pi Restarted",
@@ -324,7 +328,7 @@ def _jaguar_event(value: str) -> str:
     return mapping.get(value, value)
 
 
-def _jaguar_audio_status(value: str) -> str:
+def _june_audio_status(value: str) -> str:
     mapping = {
         "recorded": "Recorded",
         "recording_paused": "Recording paused",
@@ -342,6 +346,21 @@ def _round(value: float | None) -> str:
     if value is None:
         return ""
     return f"{value:.3f}"
+
+
+def _acoustic_csv_values(row) -> dict[str, str | int | float | None]:
+    output = {}
+    integer_fields = {"acoustic_sample_rate_hz", "acoustic_n_fft", "acoustic_hop_length"}
+    text_fields = {"acoustic_index_version", "acoustic_index_error"}
+    for column in ACOUSTIC_INDEX_COLUMNS:
+        value = row[column]
+        if column in text_fields:
+            output[column] = value or ""
+        elif column in integer_fields:
+            output[column] = value if value is not None else ""
+        else:
+            output[column] = _round(value)
+    return output
 
 
 def _mmhg_to_inhg(value: float | None) -> float | None:
@@ -376,16 +395,6 @@ def _errors_by_interval(store: DataStore) -> dict[str, list[str]]:
     for row in store.list_interval_errors():
         grouped.setdefault(row["period_start_utc"], []).append(row["error"])
     return grouped
-
-
-def _photo_counts_by_interval(store: DataStore) -> dict[str, int]:
-    if not hasattr(store, "list_photo_events"):
-        return {}
-    counts: dict[str, int] = {}
-    for row in store.list_photo_events():
-        if row["status"] == "kept":
-            counts[row["period_start_utc"]] = counts.get(row["period_start_utc"], 0) + 1
-    return counts
 
 
 def _selected_call_cells(calls: list[dict]) -> tuple[list[dict], int]:

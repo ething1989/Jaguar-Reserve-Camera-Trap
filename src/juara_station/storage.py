@@ -9,6 +9,7 @@ import json
 import sqlite3
 import time
 
+from .acoustic_indices import ACOUSTIC_INDEX_COLUMNS, ACOUSTIC_INDEX_SQL_TYPES, AcousticIndexResult
 from .metrics import diversity_from_counts, format_detection
 
 
@@ -68,6 +69,13 @@ class BirdCall:
     @property
     def top_candidate(self) -> BirdCandidate | None:
         return self.candidates[0] if self.candidates else None
+
+
+@dataclass(frozen=True)
+class AnimalDetection:
+    animal: str
+    count: int
+    avg_confidence: float | None
 
 
 class DataStore:
@@ -159,6 +167,11 @@ class DataStore:
                     bird_call_cells TEXT,
                     audio_path TEXT,
                     audio_status TEXT,
+                    animal_summary TEXT,
+                    photos_taken INTEGER NOT NULL DEFAULT 0,
+                    photos_kept INTEGER NOT NULL DEFAULT 0,
+                    photos_deleted_blank INTEGER NOT NULL DEFAULT 0,
+                    camera_status TEXT,
                     notes TEXT,
                     updated_at_utc TEXT NOT NULL
                 );
@@ -197,6 +210,25 @@ class DataStore:
                     UNIQUE(period_start_utc, call_index, rank)
                 );
 
+                CREATE TABLE IF NOT EXISTS photo_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    period_start_utc TEXT NOT NULL,
+                    triggered_at_utc TEXT NOT NULL,
+                    target_capture_at_utc TEXT NOT NULL,
+                    captured_at_utc TEXT,
+                    path TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    ai_status TEXT NOT NULL DEFAULT 'pending',
+                    animal_name TEXT,
+                    confidence REAL,
+                    raw_json TEXT,
+                    error TEXT,
+                    updated_at_utc TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_photo_events_period
+                ON photo_events(period_start_utc);
+
                 CREATE TABLE IF NOT EXISTS interval_errors (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     period_start_utc TEXT NOT NULL,
@@ -209,22 +241,9 @@ class DataStore:
 
                 CREATE INDEX IF NOT EXISTS idx_interval_errors_period
                 ON interval_errors(period_start_utc);
-
-                CREATE TABLE IF NOT EXISTS photo_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    period_start_utc TEXT NOT NULL,
-                    scheduled_for_local TEXT NOT NULL UNIQUE,
-                    captured_at_utc TEXT NOT NULL,
-                    path TEXT,
-                    status TEXT NOT NULL,
-                    error TEXT,
-                    updated_at_utc TEXT NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_photo_events_period
-                ON photo_events(period_start_utc);
                 """
             )
+            self._init_acoustic_schema(conn)
             self._ensure_column(conn, "intervals", "bird_call_cells", "TEXT")
             self._ensure_column(conn, "intervals", "system_event", "TEXT")
             self._ensure_column(conn, "sensor_samples", "co2_ppm", "REAL")
@@ -236,6 +255,22 @@ class DataStore:
                 self._ensure_column(conn, table, f"pm10_ug_m3{suffix}", "REAL")
                 self._ensure_column(conn, table, f"particles_0_3_per_l{suffix}", "REAL")
                 self._ensure_column(conn, table, f"particles_0_5_per_l{suffix}", "REAL")
+            for column in ACOUSTIC_INDEX_COLUMNS:
+                self._ensure_column(conn, "intervals", column, ACOUSTIC_INDEX_SQL_TYPES[column])
+
+    def _init_acoustic_schema(self, conn: sqlite3.Connection) -> None:
+        column_sql = ",\n                    ".join(
+            f"{column} {ACOUSTIC_INDEX_SQL_TYPES[column]}" for column in ACOUSTIC_INDEX_COLUMNS
+        )
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS acoustic_indices (
+                period_start_utc TEXT PRIMARY KEY,
+                {column_sql},
+                updated_at_utc TEXT NOT NULL
+            )
+            """
+        )
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -284,48 +319,6 @@ class DataStore:
                     sample.particles_0_3_per_l,
                     sample.particles_0_5_per_l,
                     sample.cpu_temp_c,
-                ),
-            )
-
-    def photo_event_exists(self, scheduled_for_local: str) -> bool:
-        with self.connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM photo_events WHERE scheduled_for_local = ?",
-                (scheduled_for_local,),
-            ).fetchone()
-        return row is not None
-
-    def record_photo_event(
-        self,
-        period_start: datetime,
-        scheduled_for_local: str,
-        captured_at: datetime,
-        path: str | None,
-        status: str,
-        error: str | None = None,
-    ) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO photo_events (
-                    period_start_utc, scheduled_for_local, captured_at_utc, path, status, error, updated_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(scheduled_for_local) DO UPDATE SET
-                    period_start_utc = excluded.period_start_utc,
-                    captured_at_utc = excluded.captured_at_utc,
-                    path = excluded.path,
-                    status = excluded.status,
-                    error = excluded.error,
-                    updated_at_utc = excluded.updated_at_utc
-                """,
-                (
-                    to_utc_iso(period_start),
-                    scheduled_for_local,
-                    to_utc_iso(captured_at),
-                    path,
-                    status,
-                    error,
-                    to_utc_iso(utc_now()),
                 ),
             )
 
@@ -490,6 +483,109 @@ class DataStore:
                 (to_utc_iso(utc_now()), to_utc_iso(period_start)),
             )
 
+    def save_acoustic_indices(self, period_start: datetime, indices: AcousticIndexResult) -> None:
+        columns = ", ".join(ACOUSTIC_INDEX_COLUMNS)
+        placeholders = ", ".join("?" for _ in ACOUSTIC_INDEX_COLUMNS)
+        assignments = ", ".join(f"{column} = excluded.{column}" for column in ACOUSTIC_INDEX_COLUMNS)
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO acoustic_indices (
+                    period_start_utc, {columns}, updated_at_utc
+                ) VALUES (?, {placeholders}, ?)
+                ON CONFLICT(period_start_utc) DO UPDATE SET
+                    {assignments},
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (to_utc_iso(period_start), *indices.as_db_values(), to_utc_iso(utc_now())),
+            )
+
+    def create_photo_event(self, period_start: datetime, triggered_at: datetime, target_capture_at: datetime) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO photo_events (
+                    period_start_utc, triggered_at_utc, target_capture_at_utc, status, ai_status, updated_at_utc
+                ) VALUES (?, ?, ?, 'pending', 'pending', ?)
+                """,
+                (to_utc_iso(period_start), to_utc_iso(triggered_at), to_utc_iso(target_capture_at), to_utc_iso(utc_now())),
+            )
+            return int(cursor.lastrowid)
+
+    def update_photo_event(self, photo_id: int, **fields: Any) -> None:
+        allowed = {
+            "captured_at_utc",
+            "path",
+            "status",
+            "ai_status",
+            "animal_name",
+            "confidence",
+            "raw_json",
+            "error",
+        }
+        assignments: list[str] = []
+        values: list[Any] = []
+        for key, value in fields.items():
+            if key not in allowed:
+                raise ValueError(f"Unsupported photo field: {key}")
+            assignments.append(f"{key} = ?")
+            if isinstance(value, datetime):
+                values.append(to_utc_iso(value))
+            elif key == "raw_json" and value is not None:
+                values.append(json.dumps(value))
+            else:
+                values.append(value)
+        assignments.append("updated_at_utc = ?")
+        values.append(to_utc_iso(utc_now()))
+        values.append(photo_id)
+        with self.connect() as conn:
+            conn.execute(f"UPDATE photo_events SET {', '.join(assignments)} WHERE id = ?", values)
+
+    def pending_photo_events(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT * FROM photo_events
+                    WHERE status = 'captured' AND ai_status IN ('pending', 'retry')
+                    ORDER BY triggered_at_utc ASC
+                    """
+                )
+            )
+
+    def mark_stale_pending_photo_events(self, before: datetime, error: str) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE photo_events
+                SET status = 'error',
+                    ai_status = 'error',
+                    error = COALESCE(error, ?),
+                    updated_at_utc = ?
+                WHERE status = 'pending'
+                  AND triggered_at_utc < ?
+                """,
+                (error, to_utc_iso(utc_now()), to_utc_iso(before)),
+            )
+            return int(cursor.rowcount)
+
+    def skip_unprocessed_photo_events_before(self, before: datetime, error: str) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE photo_events
+                SET status = 'skipped_unprocessed',
+                    ai_status = 'skipped',
+                    error = COALESCE(error, ?),
+                    updated_at_utc = ?
+                WHERE status = 'captured'
+                  AND ai_status IN ('pending', 'retry')
+                  AND triggered_at_utc < ?
+                """,
+                (error, to_utc_iso(utc_now()), to_utc_iso(before)),
+            )
+            return int(cursor.rowcount)
+
     def pending_audio_events(self) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return list(
@@ -519,8 +615,8 @@ class DataStore:
                 """
                 INSERT INTO intervals (
                     period_start_utc, period_end_utc, timestamp_utc, timestamp_source,
-                    system_event, audio_status, updated_at_utc
-                ) VALUES (?, ?, ?, ?, ?, '', ?)
+                    system_event, audio_status, animal_summary, updated_at_utc
+                ) VALUES (?, ?, ?, ?, ?, '', '', ?)
                 """,
                 (
                     key,
@@ -553,79 +649,67 @@ class DataStore:
     ) -> None:
         sensor = self.aggregate_sensor_samples(period_start, period_end)
         birds = self._bird_summary(period_start)
+        animals = self._animal_summary(period_start)
         audio = self._audio_summary(period_start)
+        acoustic = self._acoustic_summary(period_start)
+        camera_status = "ok" if animals["photos_taken"] else ""
+        interval_values = {
+            "period_start_utc": to_utc_iso(period_start),
+            "period_end_utc": to_utc_iso(period_end),
+            "timestamp_utc": to_utc_iso(timestamp),
+            "timestamp_source": timestamp_source,
+            "system_event": None,
+            "temperature_c_avg": sensor["temperature_c_avg"],
+            "humidity_pct_avg": sensor["humidity_pct_avg"],
+            "pressure_mmhg_avg": sensor["pressure_mmhg_avg"],
+            "lux_avg": sensor["lux_avg"],
+            "co2_ppm_avg": sensor["co2_ppm_avg"],
+            "pm1_0_ug_m3_avg": sensor["pm1_0_ug_m3_avg"],
+            "pm2_5_ug_m3_avg": sensor["pm2_5_ug_m3_avg"],
+            "pm10_ug_m3_avg": sensor["pm10_ug_m3_avg"],
+            "particles_0_3_per_l_avg": sensor["particles_0_3_per_l_avg"],
+            "particles_0_5_per_l_avg": sensor["particles_0_5_per_l_avg"],
+            "cpu_temp_c_avg": sensor["cpu_temp_c_avg"],
+            "bird_summary": birds["summary"],
+            "bird_species_richness": birds["metrics"].species_richness,
+            "bird_total_calls": birds["metrics"].total_calls,
+            "bird_total_species": birds["metrics"].species_richness,
+            "bird_top_species": birds["top_species"],
+            "bird_shannon_index": birds["metrics"].shannon,
+            "bird_simpson_index": birds["metrics"].simpson,
+            "bird_pielou_evenness": birds["metrics"].pielou_evenness,
+            "bird_call_cells": json.dumps(birds["call_cells"]),
+            "audio_path": audio["path"],
+            "audio_status": audio["status"],
+            "animal_summary": animals["summary"],
+            "photos_taken": animals["photos_taken"],
+            "photos_kept": animals["photos_kept"],
+            "photos_deleted_blank": animals["photos_deleted_blank"],
+            "camera_status": camera_status,
+            "notes": notes,
+            "updated_at_utc": to_utc_iso(utc_now()),
+        }
+        interval_values.update({column: acoustic[column] for column in ACOUSTIC_INDEX_COLUMNS})
+        columns = tuple(interval_values)
+        column_sql = ", ".join(columns)
+        placeholders = ", ".join("?" for _ in columns)
+        assignments = []
+        for column in columns:
+            if column == "period_start_utc":
+                continue
+            if column == "system_event":
+                assignments.append("system_event = COALESCE(intervals.system_event, excluded.system_event)")
+            else:
+                assignments.append(f"{column} = excluded.{column}")
         with self.connect() as conn:
             conn.execute(
-                """
-                INSERT INTO intervals (
-                    period_start_utc, period_end_utc, timestamp_utc, timestamp_source,
-                    system_event, temperature_c_avg, humidity_pct_avg, pressure_mmhg_avg, lux_avg, co2_ppm_avg,
-                    pm1_0_ug_m3_avg, pm2_5_ug_m3_avg, pm10_ug_m3_avg,
-                    particles_0_3_per_l_avg, particles_0_5_per_l_avg, cpu_temp_c_avg,
-                    bird_summary, bird_species_richness, bird_total_calls, bird_total_species,
-                    bird_top_species, bird_shannon_index, bird_simpson_index, bird_pielou_evenness, bird_call_cells,
-                    audio_path, audio_status, notes, updated_at_utc
-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                f"""
+                INSERT INTO intervals ({column_sql})
+                VALUES ({placeholders})
                 ON CONFLICT(period_start_utc) DO UPDATE SET
-                    period_end_utc = excluded.period_end_utc,
-                    timestamp_utc = excluded.timestamp_utc,
-                    timestamp_source = excluded.timestamp_source,
-                    system_event = COALESCE(intervals.system_event, excluded.system_event),
-                    temperature_c_avg = excluded.temperature_c_avg,
-                    humidity_pct_avg = excluded.humidity_pct_avg,
-                    pressure_mmhg_avg = excluded.pressure_mmhg_avg,
-                    lux_avg = excluded.lux_avg,
-                    co2_ppm_avg = excluded.co2_ppm_avg,
-                    pm1_0_ug_m3_avg = excluded.pm1_0_ug_m3_avg,
-                    pm2_5_ug_m3_avg = excluded.pm2_5_ug_m3_avg,
-                    pm10_ug_m3_avg = excluded.pm10_ug_m3_avg,
-                    particles_0_3_per_l_avg = excluded.particles_0_3_per_l_avg,
-                    particles_0_5_per_l_avg = excluded.particles_0_5_per_l_avg,
-                    cpu_temp_c_avg = excluded.cpu_temp_c_avg,
-                    bird_summary = excluded.bird_summary,
-                    bird_species_richness = excluded.bird_species_richness,
-                    bird_total_calls = excluded.bird_total_calls,
-                    bird_total_species = excluded.bird_total_species,
-                    bird_top_species = excluded.bird_top_species,
-                    bird_shannon_index = excluded.bird_shannon_index,
-                    bird_simpson_index = excluded.bird_simpson_index,
-                    bird_pielou_evenness = excluded.bird_pielou_evenness,
-                    bird_call_cells = excluded.bird_call_cells,
-                    audio_path = excluded.audio_path,
-                    audio_status = excluded.audio_status,
-                    notes = excluded.notes,
-                    updated_at_utc = excluded.updated_at_utc
+                    {", ".join(assignments)}
                 """,
-                (
-                    to_utc_iso(period_start),
-                    to_utc_iso(period_end),
-                    to_utc_iso(timestamp),
-                    timestamp_source,
-                    sensor["temperature_c_avg"],
-                    sensor["humidity_pct_avg"],
-                    sensor["pressure_mmhg_avg"],
-                    sensor["lux_avg"],
-                    sensor["co2_ppm_avg"],
-                    sensor["pm1_0_ug_m3_avg"],
-                    sensor["pm2_5_ug_m3_avg"],
-                    sensor["pm10_ug_m3_avg"],
-                    sensor["particles_0_3_per_l_avg"],
-                    sensor["particles_0_5_per_l_avg"],
-                    sensor["cpu_temp_c_avg"],
-                    birds["summary"],
-                    birds["metrics"].species_richness,
-                    birds["metrics"].total_calls,
-                    birds["metrics"].species_richness,
-                    birds["top_species"],
-                    birds["metrics"].shannon,
-                    birds["metrics"].simpson,
-                    birds["metrics"].pielou_evenness,
-                    json.dumps(birds["call_cells"]),
-                    audio["path"],
-                    audio["status"],
-                    notes,
-                    to_utc_iso(utc_now()),
-                ),
+                tuple(interval_values[column] for column in columns),
             )
 
     def refresh_interval_summary(self, period_start: datetime, default_period_seconds: int = 300) -> None:
@@ -680,6 +764,17 @@ class DataStore:
             status = f"{status}/{row['ai_status']}"
         return {"path": row["path"], "status": status}
 
+    def _acoustic_summary(self, period_start: datetime) -> dict[str, Any]:
+        column_sql = ", ".join(ACOUSTIC_INDEX_COLUMNS)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT {column_sql} FROM acoustic_indices WHERE period_start_utc = ?",
+                (to_utc_iso(period_start),),
+            ).fetchone()
+        if row is None:
+            return {column: None for column in ACOUSTIC_INDEX_COLUMNS}
+        return {column: row[column] for column in ACOUSTIC_INDEX_COLUMNS}
+
     def _bird_summary(self, period_start: datetime) -> dict[str, Any]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -711,6 +806,36 @@ class DataStore:
             calls_by_index.setdefault(int(row["call_index"]), []).append(row)
         call_cells = [_format_call_cell(rows) for _index, rows in sorted(calls_by_index.items())]
         return {"summary": summary, "metrics": metrics, "call_cells": call_cells, "top_species": top_species}
+
+    def _animal_summary(self, period_start: datetime) -> dict[str, Any]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT animal_name, confidence, status
+                FROM photo_events
+                WHERE period_start_utc = ?
+                """,
+                (to_utc_iso(period_start),),
+            ).fetchall()
+        totals: dict[str, list[float]] = {}
+        photos_taken = len(rows)
+        photos_deleted = 0
+        for row in rows:
+            if row["status"] == "deleted_blank":
+                photos_deleted += 1
+            if row["animal_name"]:
+                totals.setdefault(row["animal_name"], []).append(row["confidence"] or 0.0)
+        detections = [
+            AnimalDetection(name, len(confs), sum(confs) / len(confs) if confs else None)
+            for name, confs in sorted(totals.items())
+        ]
+        summary = "; ".join(format_detection(d.animal, "count", d.count, d.avg_confidence) for d in detections)
+        return {
+            "summary": summary,
+            "photos_taken": photos_taken,
+            "photos_kept": sum(1 for row in rows if row["status"] == "kept"),
+            "photos_deleted_blank": photos_deleted,
+        }
 
     def list_intervals_for_day(self, day_start: datetime, day_end: datetime) -> list[sqlite3.Row]:
         with self.connect() as conn:
@@ -749,18 +874,6 @@ class DataStore:
                     SELECT period_start_utc, error, source, details
                     FROM interval_errors
                     ORDER BY period_start_utc ASC, error ASC, source ASC, details ASC
-                    """
-                )
-            )
-
-    def list_photo_events(self) -> list[sqlite3.Row]:
-        with self.connect() as conn:
-            return list(
-                conn.execute(
-                    """
-                    SELECT period_start_utc, scheduled_for_local, captured_at_utc, path, status, error
-                    FROM photo_events
-                    ORDER BY captured_at_utc ASC
                     """
                 )
             )

@@ -2,28 +2,36 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date as date_type
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
+import csv
 import json
 import logging
 import math
+import os
 import shutil
 import shlex
 import subprocess
 import time
 import wave
 
+from .acoustic_indices import AcousticIndexResult, calculate_acoustic_indices
 from .ai import (
     BirdNetAudioJob,
     BirdNetRunner,
     MockBirdNetRunner,
+    MockSpeciesNetRunner,
+    SpeciesNetRunner,
+    SpeciesNetTimeoutError,
+    SpeciesNetUnavailableError,
     birdnet_week,
 )
 from .audio import AudioRecorder, MockAudioRecorder
-from .camera import create_camera
-from .config import StationConfig, is_night
+from .camera import MotionWatcher, create_camera, create_flash
+from .config import CameraModeConfig, StationConfig, is_night
 from .csv_exporter import CsvExportOptions, export_day_csv
 from .paths import StationPaths, resolve_paths
 from .sensors import MockSensorSuite, SensorSuite, read_cpu_temp
@@ -34,6 +42,26 @@ from .timekeeper import TimeKeeper
 
 LOGGER = logging.getLogger(__name__)
 UTC = timezone.utc
+
+ENVIRONMENT_SAMPLE_FIELDS = (
+    "timestamp_utc",
+    "timestamp_source",
+    "system_timestamp_utc",
+    "monotonic_seconds",
+    "boot_id",
+    "temperature_c",
+    "humidity_pct",
+    "pressure_mmhg",
+    "lux",
+    "co2_ppm",
+    "pm1_0_ug_m3",
+    "pm2_5_ug_m3",
+    "pm10_ug_m3",
+    "particles_0_3_per_l",
+    "particles_0_5_per_l",
+    "cpu_temp_c",
+    "errors",
+)
 
 
 class StationService:
@@ -47,20 +75,36 @@ class StationService:
         hardware_mock = mock or ai_only
         self.sensors = MockSensorSuite() if hardware_mock else SensorSuite(config.sensors)
         self.audio = MockAudioRecorder() if hardware_mock or not config.audio.enabled else AudioRecorder(config.audio)
+        self.camera = create_camera(config.camera, mock=hardware_mock)
+        self.flash = create_flash(config.camera, mock=hardware_mock)
         self.birdnet = MockBirdNetRunner() if mock else BirdNetRunner(config.birdnet, config.location)
-        self.camera = create_camera(config.camera, mock=hardware_mock or not config.camera.enabled)
+        self.speciesnet = MockSpeciesNetRunner() if mock else SpeciesNetRunner(config.speciesnet, config.location)
+        self._capture_lock = Lock()
         self._ai_lock = Lock()
+        self._motion_watcher: MotionWatcher | None = None
+        self._scheduled_stop = Event()
+        self._scheduled_thread: Thread | None = None
         self._audio_worker_stop = Event()
         self._audio_worker_lock = Lock()
         self._audio_worker_thread: Thread | None = None
+        self._image_worker_lock = Lock()
+        self._image_worker_thread: Thread | None = None
+        self._camera_scan_stop = Event()
+        self._camera_scan_thread: Thread | None = None
+        self._day_camera_mode_lock = Lock()
+        self._day_camera_mode = config.camera.day
         self._coordinate_retry_lock = Lock()
         self._coordinate_retry_thread: Thread | None = None
         self._coordinate_retry_stop = Event()
         self._gps_coordinates_confirmed = False
+        self._last_day_camera_scan_at: datetime | None = None
+        self._last_camera_warm_restart_at: datetime | None = None
         self._birdnet_prewarm_started = False
         self._reboot_scheduled_for: date_type | None = None
         self._startup_delay_done = False
         self._fallback_storage_since: datetime | None = None
+        self._recent_photo_triggers: list[float] = []
+        self._photo_paused_until_monotonic: float | None = None
         self._cooldown_active = False
         self._cooldown_high_count = 0
         self._cooldown_resume_count = 0
@@ -68,8 +112,8 @@ class StationService:
         self._current_latitude = config.time.fallback_latitude
         self._current_longitude = config.time.fallback_longitude
         self._coordinate_source = "fallback"
+        self._boot_id = _current_boot_id()
         self._load_initial_coordinate_state()
-        self._set_birdnet_location(self._current_latitude, self._current_longitude)
 
     def _load_initial_coordinate_state(self) -> None:
         previous = self._read_coordinate_state()
@@ -77,19 +121,6 @@ class StationService:
             return
         self._current_latitude, self._current_longitude = previous
         self._coordinate_source = "past"
-
-    def _set_birdnet_location(self, latitude: float, longitude: float) -> None:
-        if hasattr(self.birdnet, "set_location"):
-            self.birdnet.set_location(latitude, longitude)
-
-    def _uses_generated_birdnet_species_list(self) -> bool:
-        mode = str(self.config.birdnet.species_filter_mode or "generated_list").strip().lower()
-        if mode in {"generated_list", "generated", "custom_list", "custom"}:
-            return True
-        if mode in {"birdnet_location", "birdnet", "native", "location"}:
-            return False
-        LOGGER.warning("Unknown birdnet.species_filter_mode=%r; using generated_list behavior", mode)
-        return True
 
     def run_forever(self) -> None:
         self._sleep_startup_delay_once()
@@ -101,6 +132,12 @@ class StationService:
         self._export_changed_days(startup_days)
         self._ensure_coordinate_retry_worker()
         self._cleanup_stale_audio_files(utc_now())
+        self._sync_camera_window(utc_now(), force_refresh=True)
+        self._ensure_motion_watcher()
+        self._maybe_start_day_camera_scan_worker()
+        if self.config.camera.enabled and self.config.camera.scheduled_capture_times and not self.mock:
+            self._scheduled_thread = Thread(target=self._run_scheduled_captures, daemon=True)
+            self._scheduled_thread.start()
         if (
             self.config.birdnet.enabled
             and self.config.birdnet.run_in_station_service
@@ -112,15 +149,33 @@ class StationService:
         LOGGER.info("Juara station service started at %s", self.paths.root)
         try:
             while True:
-                self.run_interval()
+                try:
+                    self._ensure_motion_watcher()
+                    self.run_interval()
+                except Exception as exc:
+                    LOGGER.exception("Station interval crashed; recording failure and continuing")
+                    self._record_interval_crash(exc)
+                    time.sleep(5)
         finally:
+            self._scheduled_stop.set()
             self._audio_worker_stop.set()
+            self._camera_scan_stop.set()
             self._coordinate_retry_stop.set()
+            if self._motion_watcher:
+                self._motion_watcher.close()
+            if self._scheduled_thread:
+                self._scheduled_thread.join(timeout=2)
             if self._audio_worker_thread:
                 self._audio_worker_thread.join(timeout=2)
+            if self._image_worker_thread:
+                self._image_worker_thread.join(timeout=2)
+            if self._camera_scan_thread:
+                self._camera_scan_thread.join(timeout=2)
             if self._coordinate_retry_thread:
                 self._coordinate_retry_thread.join(timeout=2)
+            self.flash.close()
             self.camera.close()
+            self._last_camera_warm_restart_at = None
 
     def _sleep_startup_delay_once(self) -> None:
         if self._startup_delay_done:
@@ -149,9 +204,27 @@ class StationService:
                 refreshed.database_path,
             )
             return
+        self._copy_fallback_media_to_usb(refreshed)
         self.paths = refreshed
         self._fallback_storage_since = None
         LOGGER.warning("USB storage became available; station outputs switched to %s", self.paths.root)
+
+    def _copy_fallback_media_to_usb(self, target_paths: StationPaths) -> None:
+        fallback_photos = self.paths.photos_dir
+        if not fallback_photos.exists():
+            return
+        for source in fallback_photos.glob("**/*"):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(fallback_photos)
+            target = target_paths.photos_dir / relative
+            if target.exists():
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+            except OSError:
+                LOGGER.warning("Unable to copy fallback media file to USB: %s", source, exc_info=True)
 
     def _record_time_source_errors(self, period_start: datetime, reading) -> None:
         if reading.source == "estimated":
@@ -189,7 +262,31 @@ class StationService:
         except Exception:
             LOGGER.exception("%s reboot command failed", reason)
 
-    def run_interval(self, duration_seconds: int | None = None) -> Path:
+    def _record_interval_crash(self, exc: Exception) -> None:
+        try:
+            reading = self.timekeeper.now(fallback_step=timedelta(seconds=self.config.schedule.interval_seconds))
+            timestamp = reading.timestamp
+            timestamp_source = reading.source
+        except Exception:
+            timestamp = utc_now()
+            timestamp_source = "system"
+        period_start = floor_time(timestamp, self.config.schedule.interval_seconds)
+        period_end = period_start + timedelta(seconds=self.config.schedule.interval_seconds)
+        try:
+            self.store.upsert_interval_summary(
+                period_start,
+                period_end,
+                timestamp,
+                timestamp_source,
+                f"interval crash: {type(exc).__name__}",
+            )
+            self.store.set_interval_system_event(period_start, "STATION_INTERVAL_CRASH")
+            self.store.add_interval_error(period_start, "Station Interval Crash", source="service", details=str(exc))
+            self._export_day(period_start.astimezone(self.config.zoneinfo).date())
+        except Exception:
+            LOGGER.exception("Unable to record station interval crash")
+
+    def run_interval(self, duration_seconds: int | None = None, simulate_motion: bool = False) -> Path:
         duration = duration_seconds or self.config.schedule.interval_seconds
         self._maybe_switch_storage_root()
         if self._cooldown_marker_exists():
@@ -204,15 +301,23 @@ class StationService:
         notes = "; ".join(filter(None, [reading.note, "fallback storage active" if self.paths.fallback_active else ""]))
         self._record_time_source_errors(period_start, reading)
         self._check_usb_missing_watchdog(reading.timestamp, period_start)
+        self._sync_camera_window(reading.timestamp)
         changed_days = self._recover_audio_recording_state(reading.timestamp)
         self._cleanup_stale_audio_files(reading.timestamp)
+        self._mark_stale_pending_photos(reading.timestamp)
+        self._skip_expired_photo_backlog(reading.timestamp)
         changed_days.update(self._purge_audio_backlog_if_due(reading.timestamp))
         self._ensure_coordinate_retry_worker()
+        if self.config.speciesnet.enabled and self.config.speciesnet.run_in_station_service and not self.mock:
+            self._ensure_image_worker()
+
+        if simulate_motion:
+            self.handle_motion()
 
         audio_result = None
         audio_paused_reason = self._audio_paused_reason(local_start)
         if audio_paused_reason:
-            self._sample_until(period_end, duration)
+            self._sample_until(period_end, duration, reading.timestamp, reading.source)
             self.store.upsert_audio_event(
                 period_start,
                 "recording_paused",
@@ -227,7 +332,7 @@ class StationService:
             audio_path = self._audio_path(period_start)
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(self.audio.record, audio_path, duration, night)
-                self._sample_until(period_end, duration)
+                self._sample_until(period_end, duration, reading.timestamp, reading.source)
                 audio_result = future.result()
 
             self.store.upsert_audio_event(
@@ -266,8 +371,11 @@ class StationService:
                     self.process_audio_event(period_start, audio_result.path, night)
                 elif self.config.birdnet.run_in_station_service:
                     self._ensure_audio_worker()
+            elif audio_result.status == "recorded" and audio_result.path:
+                self._save_acoustic_indices(period_start, audio_result.path)
 
-        changed_days.update(self._capture_due_scheduled_photos(period_start, period_end))
+        if self.mock:
+            changed_days.update(self.process_image_backlog(now=utc_now()))
         self.store.upsert_interval_summary(period_start, period_end, reading.timestamp, reading.source, notes or None)
         if self._cooldown_just_entered:
             self.store.set_interval_system_event(period_start, "PI_COOLDOWN")
@@ -287,7 +395,7 @@ class StationService:
         timestamp: datetime,
         duration_seconds: int,
     ) -> Path:
-        self._sample_cpu_only_until(duration_seconds)
+        self._sample_until(period_end, duration_seconds, timestamp, "system")
         self.store.upsert_audio_event(
             period_start,
             "recording_paused",
@@ -309,15 +417,14 @@ class StationService:
     def _export_day(self, day: date_type) -> Path:
         output_path = self.paths.logs_dir / self.config.storage.csv_filename
         try:
-            exported = export_day_csv(
+            return export_day_csv(
                 self.store,
                 self.paths.logs_dir,
                 datetime.combine(day, datetime.min.time(), tzinfo=self.config.zoneinfo),
                 self.config.zoneinfo,
+                include_photos=self.config.camera.enabled,
                 options=self._csv_export_options(),
             )
-            self._trigger_drive_sync(f"CSV export {exported.name}")
-            return exported
         except Exception as exc:
             LOGGER.exception("CSV export failed for %s", day)
             self.store.add_interval_error(
@@ -332,24 +439,11 @@ class StationService:
         return CsvExportOptions(
             filename=self.config.storage.csv_filename,
             profile=self.config.storage.csv_profile,
+            include_photos=self.config.camera.enabled,
             latitude=self._current_latitude,
             longitude=self._current_longitude,
             interval_seconds=self.config.schedule.interval_seconds,
         )
-
-    def _trigger_drive_sync(self, reason: str) -> None:
-        if self.mock:
-            return
-        if not self.config.drive_sync.enabled or not self.config.drive_sync.trigger_on_csv_export:
-            return
-        command = shlex.split(self.config.drive_sync.trigger_command)
-        if not command:
-            return
-        try:
-            subprocess.run(command, check=False, timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            LOGGER.info("Google Drive sync requested after %s", reason)
-        except Exception:
-            LOGGER.warning("Could not request Google Drive sync after %s", reason, exc_info=True)
 
     def _prepare_dynamic_coordinates_and_species(self, log_non_gps_event: bool = True) -> set[date_type]:
         changed_days: set[date_type] = set()
@@ -370,7 +464,6 @@ class StationService:
         self._current_longitude = longitude
         self._coordinate_source = source
         self._gps_coordinates_confirmed = source == "gps"
-        self._set_birdnet_location(latitude, longitude)
 
         event = {
             "gps": "GPS_COORDINATES",
@@ -391,13 +484,6 @@ class StationService:
         output_path = self.config.time.active_species_list_path
         if output_path is None and self.config.birdnet.species_list_path:
             output_path = Path(self.config.birdnet.species_list_path)
-        if not self._uses_generated_birdnet_species_list():
-            LOGGER.warning(
-                "BirdNET native location filter enabled; active species list rebuild skipped for lat=%.5f lon=%.5f",
-                latitude,
-                longitude,
-            )
-            return changed_days
         if pack_root is None or output_path is None:
             return changed_days
         if source != "gps" and not log_non_gps_event:
@@ -406,10 +492,10 @@ class StationService:
         try:
             selection = write_active_species_list(Path(pack_root), Path(output_path), latitude, longitude)
             LOGGER.warning(
-                "Active BirdNET species list rebuilt from %s coordinates: %s species from %s nearest cells",
+                "Active BirdNET species list rebuilt from %s coordinates: %s species, region=%s",
                 source,
                 selection.species_count,
-                len(selection.cell_files),
+                selection.region_key or "",
             )
         except Exception as exc:
             LOGGER.exception("Dynamic BirdNET species-list rebuild failed")
@@ -421,7 +507,7 @@ class StationService:
     def _ensure_coordinate_retry_worker(self) -> None:
         if self.mock or self.ai_only:
             return
-        if not self.config.time.coordinate_enabled or not self.config.time.gps_enabled or self._gps_coordinates_confirmed:
+        if not self.config.time.coordinate_enabled or self._gps_coordinates_confirmed:
             return
         with self._coordinate_retry_lock:
             if self._coordinate_retry_thread and self._coordinate_retry_thread.is_alive():
@@ -624,13 +710,66 @@ class StationService:
                 LOGGER.debug("AI worker cooldown stop command failed: %s", command, exc_info=True)
         LOGGER.warning("Unable to stop AI worker immediately for CPU cooldown; marker will stop the next cycle")
 
+    def _mark_stale_pending_photos(self, now: datetime) -> None:
+        stale_after = max(60, self.config.schedule.interval_seconds * 2)
+        before = now - timedelta(seconds=stale_after)
+        count = self.store.mark_stale_pending_photo_events(
+            before,
+            f"Capture did not finish within {stale_after} seconds; marked stale on service recovery",
+        )
+        if count:
+            LOGGER.warning("Marked %s stale pending photo event(s) as camera errors", count)
+
+    def _skip_expired_photo_backlog(self, now: datetime) -> None:
+        cutoff = self._photo_processing_cutoff(now)
+        count = self.store.skip_unprocessed_photo_events_before(
+            cutoff,
+            "Photo AI skipped after the 6 AM processing deadline",
+        )
+        if count:
+            LOGGER.warning("Skipped %s unprocessed photo event(s) before %s", count, cutoff.isoformat())
+
+    def _photo_processing_cutoff(self, now: datetime) -> datetime:
+        local = now.astimezone(self.config.zoneinfo)
+        deadline = datetime.combine(local.date(), datetime.min.time(), tzinfo=self.config.zoneinfo).replace(
+            hour=self.config.schedule.photo_processing_deadline_hour
+        )
+        if local < deadline:
+            deadline -= timedelta(days=1)
+        return deadline.astimezone(UTC)
+
+    def _ensure_motion_watcher(self) -> None:
+        if self.mock or not (self.config.camera.enabled and self.config.camera.motion_enabled):
+            return
+        if self._motion_watcher is not None:
+            return
+        watcher = MotionWatcher(self.config.camera.pir_gpio, self.handle_motion)
+        try:
+            watcher.start()
+            self._motion_watcher = watcher
+            LOGGER.info("Motion detector watching GPIO%s", self.config.camera.pir_gpio)
+        except Exception:
+            try:
+                watcher.close()
+            except Exception:
+                LOGGER.debug("Motion watcher cleanup after failed start failed", exc_info=True)
+            LOGGER.exception("Motion detector unavailable; will retry on the next interval")
+
+    def _save_acoustic_indices(self, period_start: datetime, audio_path: Path) -> None:
+        try:
+            indices = calculate_acoustic_indices(audio_path)
+        except Exception as exc:
+            LOGGER.warning("Acoustic index calculation failed for %s: %s", audio_path, exc, exc_info=True)
+            indices = AcousticIndexResult.from_error(str(exc))
+        self.store.save_acoustic_indices(period_start, indices)
+
     def process_audio_event(self, period_start: datetime, audio_path: Path, night: bool) -> None:
         if not audio_path.exists():
             self._mark_missing_audio(period_start, audio_path)
             return
+        self._save_acoustic_indices(period_start, audio_path)
         output_dir = self.paths.ai_work_dir / "birdnet" / period_start.strftime("%Y%m%d_%H%M%S")
         try:
-            self._set_birdnet_location(self._current_latitude, self._current_longitude)
             calls = self.birdnet.analyze_audio(audio_path, output_dir, period_start, night)
             self.store.save_bird_calls(period_start, calls)
             self.store.upsert_audio_event(period_start, "recorded", str(audio_path), ai_status="done")
@@ -659,7 +798,7 @@ class StationService:
                 LOGGER.exception("AI backlog worker cycle failed")
             time.sleep(sleep_seconds)
 
-    def run_ai_worker_once(self, now: datetime | None = None) -> set:
+    def run_ai_worker_once(self, now: datetime | None = None, manage_camera: bool = False) -> set:
         now = now or utc_now()
         if self._cooldown_marker_exists():
             LOGGER.warning("Skipping AI worker cycle because CPU cooldown marker is active")
@@ -675,15 +814,17 @@ class StationService:
                 if ready_rows:
                     changed_days.update(self.process_audio_backlog_rows(ready_rows))
                     self._maybe_schedule_post_audio_reboot(ready_rows, now)
+        if self.config.speciesnet.enabled:
+            changed_days.update(self.process_image_backlog(now=now, manage_camera=manage_camera))
         for day in sorted(changed_days):
             export_day_csv(
                 self.store,
                 self.paths.logs_dir,
                 datetime.combine(day, datetime.min.time(), tzinfo=self.config.zoneinfo),
                 self.config.zoneinfo,
+                include_photos=self.config.camera.enabled,
                 options=self._csv_export_options(),
             )
-            self._trigger_drive_sync("AI worker CSV export")
         return changed_days
 
     def planned_reboot_cleanup(self, now: datetime | None = None) -> set[date_type]:
@@ -710,12 +851,15 @@ class StationService:
             if self._cooldown_marker_exists():
                 LOGGER.warning("Stopping BirdNET backlog before processing because CPU cooldown marker is active")
                 return changed_days
+            if hasattr(self.speciesnet, "unload"):
+                self.speciesnet.unload()
             for group in self._audio_backlog_groups(rows):
                 if self._cooldown_marker_exists():
                     LOGGER.warning("Stopping BirdNET backlog before next batch because CPU cooldown marker is active")
                     break
+                for job, _row in group["jobs"]:
+                    self._save_acoustic_indices(job.period_start, job.audio_path)
                 try:
-                    self._set_birdnet_location(self._current_latitude, self._current_longitude)
                     batch_detections = self.birdnet.analyze_audio_batch(
                         [job for job, _row in group["jobs"]],
                         group["output_dir"],
@@ -763,6 +907,10 @@ class StationService:
     def _mark_missing_audio(self, period_start: datetime, audio_path: Path) -> None:
         LOGGER.warning("Skipping missing audio recording for %s: %s", period_start.isoformat(), audio_path)
         self.store.save_bird_calls(period_start, [])
+        self.store.save_acoustic_indices(
+            period_start,
+            AcousticIndexResult.from_error(f"Missing audio recording: {audio_path}"),
+        )
         self.store.upsert_audio_event(
             period_start,
             "missing_audio",
@@ -783,6 +931,32 @@ class StationService:
             self._audio_worker_thread = Thread(target=self._run_audio_backlog_worker, daemon=True)
             self._audio_worker_thread.start()
 
+    def _ensure_image_worker(self) -> None:
+        if not self.config.speciesnet.enabled:
+            return
+        if not self.config.speciesnet.run_in_station_service and not self.mock:
+            return
+        with self._image_worker_lock:
+            if self._image_worker_thread and self._image_worker_thread.is_alive():
+                return
+            self._image_worker_thread = Thread(target=self._run_image_backlog_worker, daemon=True)
+            self._image_worker_thread.start()
+
+    def _run_image_backlog_worker(self) -> None:
+        try:
+            changed_days = self.process_image_backlog(now=utc_now())
+            for day in sorted(changed_days):
+                export_day_csv(
+                    self.store,
+                    self.paths.logs_dir,
+                    datetime.combine(day, datetime.min.time(), tzinfo=self.config.zoneinfo),
+                    self.config.zoneinfo,
+                    include_photos=self.config.camera.enabled,
+                    options=self._csv_export_options(),
+                )
+        except Exception:
+            LOGGER.exception("Image AI backlog worker failed")
+
     def _maybe_start_birdnet_prewarm(self) -> None:
         if self.mock or not self.config.birdnet.enabled:
             return
@@ -802,11 +976,37 @@ class StationService:
         try:
             local = started_at.astimezone(self.config.zoneinfo)
             with self._ai_lock:
-                self._set_birdnet_location(self._current_latitude, self._current_longitude)
+                if hasattr(self.speciesnet, "unload"):
+                    self.speciesnet.unload()
                 self.birdnet.prewarm(self.paths.ai_work_dir / "birdnet_prewarm", started_at, self._is_night(local))
             LOGGER.info("BirdNET prewarm finished")
+            self._refresh_warm_camera("BirdNET startup", force=True)
         except Exception:
             LOGGER.exception("BirdNET prewarm failed; first real audio batch will retry normally")
+
+    def _restart_warm_camera_after_ai(self, reason: str) -> None:
+        self._refresh_warm_camera(reason, force=True)
+
+    def _refresh_warm_camera(self, reason: str, force: bool = False, now: datetime | None = None) -> None:
+        now = now or utc_now()
+        if not self._camera_should_stay_warm(now):
+            return
+        if not self._capture_lock.acquire(blocking=False):
+            return
+        try:
+            try:
+                if force:
+                    self.camera.restart()
+                else:
+                    self.camera.start()
+                self.camera.apply_mode(self._current_day_camera_mode())
+                self._last_camera_warm_restart_at = now
+                LOGGER.info("Camera warm stream refreshed after %s", reason)
+            except Exception:
+                self._last_camera_warm_restart_at = None
+                LOGGER.exception("Camera refresh after %s failed", reason)
+        finally:
+            self._capture_lock.release()
 
     def _run_audio_backlog_worker(self) -> None:
         try:
@@ -818,9 +1018,9 @@ class StationService:
                         self.paths.logs_dir,
                         datetime.combine(day, datetime.min.time(), tzinfo=self.config.zoneinfo),
                         self.config.zoneinfo,
+                        include_photos=self.config.camera.enabled,
                         options=self._csv_export_options(),
                     )
-                    self._trigger_drive_sync("audio purge CSV export")
                 rows = self.store.pending_audio_events()
                 if not rows:
                     break
@@ -841,9 +1041,9 @@ class StationService:
                         self.paths.logs_dir,
                         datetime.combine(day, datetime.min.time(), tzinfo=self.config.zoneinfo),
                         self.config.zoneinfo,
+                        include_photos=self.config.camera.enabled,
                         options=self._csv_export_options(),
                     )
-                    self._trigger_drive_sync("audio backlog CSV export")
                 self._maybe_schedule_post_audio_reboot(ready_rows, now)
         except Exception:
             LOGGER.exception("Audio AI backlog worker failed")
@@ -1213,12 +1413,402 @@ class StationService:
                 )
                 yield {"week": week, "night": night, "jobs": chunk, "output_dir": output_dir}
 
-    def _sample_until(self, period_end: datetime, duration_seconds: int) -> None:
+    def process_image_backlog(self, now: datetime | None = None, manage_camera: bool = True) -> set:
+        if not self.config.speciesnet.enabled:
+            return set()
+        now = now or utc_now()
+        self._skip_expired_photo_backlog(now)
+        if self.store.pending_audio_events():
+            LOGGER.info("Skipping SpeciesNet image processing because audio AI is pending")
+            return set()
+        now_local = now.astimezone(self.config.zoneinfo)
+        ready_rows = []
+        for row in self.store.pending_photo_events():
+            triggered = from_iso(row["triggered_at_utc"])
+            triggered_local = triggered.astimezone(self.config.zoneinfo)
+            if not self._photo_ai_deferred(triggered_local, now_local):
+                ready_rows.append(row)
+        max_photos = max(1, self.config.speciesnet.max_photos_per_run)
+        ready_rows = ready_rows[:max_photos]
+        if not ready_rows:
+            return set()
+
+        if not self._ai_lock.acquire(blocking=False):
+            LOGGER.info("Skipping SpeciesNet image processing because BirdNET is busy")
+            return set()
+        changed_days = set()
+        camera_paused = False
+        try:
+            if manage_camera and self._camera_should_stay_warm(now):
+                if not self._capture_lock.acquire(blocking=False):
+                    LOGGER.info("Skipping SpeciesNet image processing because the camera is busy")
+                    return set()
+                camera_paused = True
+                try:
+                    self.camera.close()
+                    LOGGER.info("Camera warm stream closed before SpeciesNet image processing")
+                except Exception:
+                    LOGGER.exception("Camera close before SpeciesNet image processing failed")
+                    self._capture_lock.release()
+                    camera_paused = False
+                    return set()
+            for row in ready_rows:
+                photo_path = Path(row["path"])
+                period_start = from_iso(row["period_start_utc"])
+                try:
+                    prediction = self.speciesnet.analyze_photo(photo_path, self.paths.ai_work_dir / "speciesnet")
+                    if prediction.blank:
+                        if self.config.speciesnet.delete_blanks:
+                            photo_path.unlink(missing_ok=True)
+                        self.store.update_photo_event(
+                            row["id"],
+                            status="deleted_blank",
+                            ai_status="done",
+                            confidence=prediction.confidence,
+                            raw_json=prediction.raw,
+                        )
+                    else:
+                        self.store.update_photo_event(
+                            row["id"],
+                            status="kept",
+                            ai_status="done",
+                            animal_name=prediction.label,
+                            confidence=prediction.confidence,
+                            raw_json=prediction.raw,
+                        )
+                    self.store.refresh_interval_summary(period_start, self.config.schedule.interval_seconds)
+                    changed_days.add(period_start.astimezone(self.config.zoneinfo).date())
+                except Exception as exc:
+                    LOGGER.exception("SpeciesNet failed for %s", photo_path)
+                    if _speciesnet_failure_is_terminal(exc):
+                        self.store.update_photo_event(row["id"], status="kept", ai_status="error", error=str(exc))
+                        self.store.refresh_interval_summary(period_start, self.config.schedule.interval_seconds)
+                        changed_days.add(period_start.astimezone(self.config.zoneinfo).date())
+                    else:
+                        self.store.update_photo_event(row["id"], ai_status="retry", error=str(exc))
+        finally:
+            if camera_paused:
+                try:
+                    self.camera.start()
+                    LOGGER.info("Camera warm stream restarted after SpeciesNet image processing")
+                except Exception:
+                    LOGGER.exception("Camera restart after SpeciesNet image processing failed")
+                finally:
+                    self._capture_lock.release()
+            if self.store.pending_audio_events() and hasattr(self.speciesnet, "unload"):
+                self.speciesnet.unload()
+            self._ai_lock.release()
+        return changed_days
+
+    def handle_motion(self) -> None:
+        if self._cooldown_marker_exists():
+            LOGGER.warning("Ignoring motion trigger because CPU cooldown mode is active")
+            return
+        Thread(target=self._capture_motion_photo, daemon=True).start()
+
+    def handle_scheduled_capture(self, scheduled_at: datetime | None = None) -> None:
+        if self._cooldown_marker_exists():
+            LOGGER.warning("Ignoring scheduled capture because CPU cooldown mode is active")
+            return
+        Thread(target=self._capture_scheduled_photo, args=(scheduled_at,), daemon=True).start()
+
+    def _run_scheduled_captures(self) -> None:
+        times = self.config.camera.scheduled_capture_times
+        while not self._scheduled_stop.is_set():
+            try:
+                reading = self.timekeeper.now(fallback_step=timedelta(seconds=60))
+                now_utc = reading.timestamp
+                now_local = now_utc.astimezone(self.config.zoneinfo)
+                next_local = next_scheduled_capture(now_local, times)
+                next_utc = next_local.astimezone(UTC)
+                delay = max(0.0, (next_utc - now_utc).total_seconds())
+                if self._scheduled_stop.wait(delay):
+                    break
+                self.handle_scheduled_capture(next_utc)
+            except Exception:
+                LOGGER.exception("Scheduled camera loop failed")
+                self._scheduled_stop.wait(60)
+
+    def _capture_motion_photo(self) -> None:
+        triggered_at = utc_now()
+        delay = self.config.schedule.motion_capture_delay_seconds
+        if self._is_night(triggered_at.astimezone(self.config.zoneinfo)):
+            delay = self.config.schedule.night_motion_capture_delay_seconds
+        self._capture_photo(delay, "motion", triggered_at=triggered_at)
+
+    def _capture_scheduled_photo(self, scheduled_at: datetime | None = None) -> None:
+        self._capture_photo(0.0, "scheduled", triggered_at=scheduled_at)
+
+    def _capture_photo(self, delay_seconds: float, source: str, triggered_at: datetime | None = None) -> None:
+        triggered_at = triggered_at or utc_now()
+        local_trigger = triggered_at.astimezone(self.config.zoneinfo)
+        if self._photo_capture_disabled(local_trigger):
+            LOGGER.info(
+                "Ignoring %s photo trigger at %s because photo capture is disabled",
+                source,
+                local_trigger.isoformat(),
+            )
+            return
+        if self._photo_rate_limited(source, local_trigger):
+            return
+        if not self._capture_lock.acquire(blocking=False):
+            LOGGER.info("Ignoring %s photo trigger at %s because camera is busy", source, local_trigger.isoformat())
+            return
+        try:
+            target_at = triggered_at + timedelta(seconds=delay_seconds)
+            period_start = floor_time(triggered_at, self.config.schedule.interval_seconds)
+            night = self._is_night(local_trigger)
+            photo_id = self.store.create_photo_event(period_start, triggered_at, target_at)
+            path = self._photo_path(triggered_at, photo_id)
+            target_monotonic_ns = time.monotonic_ns() + int(delay_seconds * 1e9)
+            LOGGER.info(
+                "%s photo trigger id=%s trigger=%s target_delay_seconds=%.3f target=%s",
+                source.capitalize(),
+                photo_id,
+                triggered_at.isoformat(),
+                delay_seconds,
+                target_at.isoformat(),
+            )
+            if night:
+                try:
+                    self.flash.on()
+                except Exception:
+                    LOGGER.exception("Flash activation failed")
+            try:
+                result = self.camera.capture_at(
+                    path,
+                    target_monotonic_ns,
+                    self.config.camera.night if night else self._current_day_camera_mode(),
+                )
+                if night:
+                    time.sleep(self.config.schedule.flash_after_capture_seconds)
+                    try:
+                        self.flash.off()
+                    except Exception:
+                        LOGGER.exception("Flash deactivation failed")
+                if result.status == "captured" and result.path:
+                    trigger_latency = (result.captured_at - triggered_at).total_seconds()
+                    target_offset = (result.captured_at - target_at).total_seconds()
+                    LOGGER.info(
+                        "%s photo captured id=%s trigger_to_capture_seconds=%.3f target_offset_seconds=%.3f path=%s",
+                        source.capitalize(),
+                        photo_id,
+                        trigger_latency,
+                        target_offset,
+                        result.path,
+                    )
+                    next_status = "captured" if self.config.speciesnet.enabled else "kept"
+                    next_ai_status = "pending" if self.config.speciesnet.enabled else "skipped"
+                    self.store.update_photo_event(
+                        photo_id,
+                        status=next_status,
+                        ai_status=next_ai_status,
+                        captured_at_utc=result.captured_at,
+                        path=str(result.path),
+                    )
+                else:
+                    self.store.update_photo_event(photo_id, status="error", ai_status="error", error=result.error)
+                    self.store.add_interval_error(
+                        period_start,
+                        "Camera Failed",
+                        source="camera",
+                        details=result.error,
+                    )
+            except Exception as exc:
+                LOGGER.exception("%s photo capture failed", source.capitalize())
+                self.store.update_photo_event(photo_id, status="error", ai_status="error", error=str(exc))
+                self.store.add_interval_error(
+                    period_start,
+                    "Camera Failed",
+                    source="camera",
+                    details=str(exc),
+                )
+        finally:
+            try:
+                try:
+                    self.flash.off()
+                except Exception:
+                    LOGGER.exception("Flash cleanup failed")
+                if not self._camera_should_stay_warm(utc_now()):
+                    try:
+                        self.camera.close()
+                    except Exception:
+                        LOGGER.exception("Camera close failed")
+            finally:
+                self._capture_lock.release()
+
+    def _current_day_camera_mode(self) -> CameraModeConfig:
+        with self._day_camera_mode_lock:
+            return self._day_camera_mode
+
+    def _set_day_camera_mode(self, mode: CameraModeConfig) -> None:
+        with self._day_camera_mode_lock:
+            self._day_camera_mode = mode
+
+    def _maybe_start_day_camera_scan_worker(self) -> None:
+        if self.mock or self.ai_only:
+            return
+        if not (self.config.camera.enabled and self.config.camera.motion_enabled and self.config.camera.day_scan_enabled):
+            return
+        if self._camera_scan_thread and self._camera_scan_thread.is_alive():
+            return
+        self._camera_scan_stop.clear()
+        self._camera_scan_thread = Thread(target=self._run_day_camera_scan_worker, daemon=True)
+        self._camera_scan_thread.start()
+
+    def _run_day_camera_scan_worker(self) -> None:
+        LOGGER.info(
+            "Day camera tuning scan enabled every %ss from %02d:00 to %02d:00",
+            self.config.camera.day_scan_interval_seconds,
+            self.config.camera.day_scan_start_hour,
+            self.config.camera.day_scan_end_hour,
+        )
+        while not self._camera_scan_stop.is_set():
+            now = utc_now()
+            try:
+                if self._day_camera_scan_due(now):
+                    self._run_day_camera_scan(now)
+            except Exception:
+                LOGGER.exception("Day camera tuning scan failed")
+            self._camera_scan_stop.wait(60)
+
+    def _day_camera_scan_due(self, now: datetime) -> bool:
+        local = now.astimezone(self.config.zoneinfo)
+        if not _hour_in_window(
+            local.hour,
+            self.config.camera.day_scan_start_hour,
+            self.config.camera.day_scan_end_hour,
+        ):
+            return False
+        if self._last_day_camera_scan_at is None:
+            return True
+        interval = max(60, self.config.camera.day_scan_interval_seconds)
+        return (now - self._last_day_camera_scan_at).total_seconds() >= interval
+
+    def _run_day_camera_scan(self, now: datetime) -> None:
+        if not self._camera_should_stay_warm(now):
+            return
+        if not self._capture_lock.acquire(blocking=False):
+            LOGGER.info("Skipping day camera tuning scan because camera is busy")
+            return
+        try:
+            candidates = _parse_camera_scan_candidates(self.config.camera.day_scan_candidates)
+            candidates = _cap_camera_scan_candidates(candidates, self.config.camera.max_exposure_us)
+            if not candidates:
+                LOGGER.warning("Skipping day camera tuning scan because no valid candidates are configured")
+                self._last_day_camera_scan_at = now
+                return
+            selected = self._scan_day_camera_candidates(candidates)
+            if selected is not None:
+                self._set_day_camera_mode(selected)
+            self._last_day_camera_scan_at = now
+            LOGGER.info("Day camera tuning scan finished; keeping existing warm stream open")
+        finally:
+            self._capture_lock.release()
+
+    def _scan_day_camera_candidates(self, candidates: list[CameraModeConfig]) -> CameraModeConfig | None:
+        try:
+            from PIL import Image, ImageStat
+        except Exception:
+            LOGGER.exception("PIL is unavailable; cannot run day camera tuning scan")
+            return None
+
+        scan_dir = Path("/tmp/juara-camera-scan")
+        scan_dir.mkdir(parents=True, exist_ok=True)
+        best: tuple[float, CameraModeConfig, dict] | None = None
+        for index, mode in enumerate(candidates, start=1):
+            path = scan_dir / f"scan_{int(time.time())}_{index}.jpg"
+            settle_path = scan_dir / f"scan_{int(time.time())}_{index}_settle.jpg"
+            try:
+                settle_result = self.camera.capture_at(settle_path, time.monotonic_ns(), mode)
+                settle_path.unlink(missing_ok=True)
+                settle_path.with_name(f"._{settle_path.name}").unlink(missing_ok=True)
+                if settle_result.status != "captured":
+                    LOGGER.warning("Day camera scan settle frame failed mode=%s error=%s", mode, settle_result.error)
+                    continue
+                time.sleep(0.05)
+                result = self.camera.capture_at(path, time.monotonic_ns(), mode)
+                if result.status != "captured" or not path.exists():
+                    LOGGER.warning("Day camera scan candidate failed mode=%s error=%s", mode, result.error)
+                    continue
+                image = Image.open(path).convert("L")
+                stat = ImageStat.Stat(image)
+                mean = float(stat.mean[0])
+                stddev = float(stat.stddev[0])
+                extrema = image.getextrema()
+                histogram = image.histogram()
+                pixels = max(1, image.width * image.height)
+                dark_pct = sum(histogram[:8]) * 100.0 / pixels
+                bright_pct = sum(histogram[248:]) * 100.0 / pixels
+                score = _day_camera_scan_score(
+                    mode,
+                    mean,
+                    stddev,
+                    dark_pct,
+                    bright_pct,
+                    self.config.camera.day_scan_target_luma,
+                )
+                metrics = {
+                    "mean_luma": mean,
+                    "stddev_luma": stddev,
+                    "dark_pct": dark_pct,
+                    "bright_pct": bright_pct,
+                    "min_luma": extrema[0],
+                    "max_luma": extrema[1],
+                    "bytes": path.stat().st_size,
+                    "score": score,
+                }
+                LOGGER.info(
+                    "Day camera scan candidate exposure_us=%s gain=%s score=%.2f mean=%.1f dark=%.1f%% bright=%.1f%%",
+                    mode.exposure_us,
+                    mode.analogue_gain,
+                    score,
+                    mean,
+                    dark_pct,
+                    bright_pct,
+                )
+                if best is None or score < best[0]:
+                    best = (score, mode, metrics)
+            except Exception:
+                LOGGER.exception("Day camera scan candidate crashed for mode=%s", mode)
+            finally:
+                path.unlink(missing_ok=True)
+                path.with_name(f"._{path.name}").unlink(missing_ok=True)
+                time.sleep(0.15)
+        try:
+            scan_dir.rmdir()
+        except OSError:
+            pass
+        if best is None:
+            LOGGER.warning("Day camera tuning scan found no usable candidate; keeping current mode=%s", self._current_day_camera_mode())
+            return None
+        _score, mode, metrics = best
+        LOGGER.info(
+            "Day camera tuning selected exposure_us=%s gain=%s mean=%.1f dark=%.1f%% bright=%.1f%% score=%.2f",
+            mode.exposure_us,
+            mode.analogue_gain,
+            metrics["mean_luma"],
+            metrics["dark_pct"],
+            metrics["bright_pct"],
+            metrics["score"],
+        )
+        return mode
+
+    def _sample_until(
+        self,
+        period_end: datetime,
+        duration_seconds: int,
+        timestamp_start: datetime | None = None,
+        timestamp_source: str = "system",
+    ) -> None:
         deadline = time.monotonic() + duration_seconds
+        timestamp_monotonic_start = time.monotonic()
         sample_every = max(1, self.config.schedule.sensor_sample_seconds)
         while True:
             try:
-                sample = self.sensors.sample()
+                raw_sample = self.sensors.sample()
+                sample = self._sample_with_station_time(raw_sample, timestamp_start, timestamp_monotonic_start)
+                self._append_environment_sample(sample, timestamp_source, raw_sample.sampled_at)
                 self.store.insert_sensor_sample(sample)
                 self._update_cooldown_counts(sample.cpu_temp_c)
                 sample_period = floor_time(sample.sampled_at, self.config.schedule.interval_seconds)
@@ -1235,6 +1825,56 @@ class StationService:
             if remaining <= 0:
                 break
             time.sleep(min(sample_every, remaining))
+
+    def _sample_with_station_time(
+        self,
+        sample: SensorSample,
+        timestamp_start: datetime | None,
+        timestamp_monotonic_start: float,
+    ) -> SensorSample:
+        if timestamp_start is None:
+            return sample
+        elapsed = max(0.0, time.monotonic() - timestamp_monotonic_start)
+        return replace(sample, sampled_at=timestamp_start + timedelta(seconds=elapsed))
+
+    def _append_environment_sample(
+        self,
+        sample: SensorSample,
+        timestamp_source: str,
+        system_sampled_at: datetime,
+    ) -> None:
+        path = self.paths.logs_dir / self.config.storage.environment_csv_filename
+        row = {
+            "timestamp_utc": to_utc_iso(sample.sampled_at),
+            "timestamp_source": timestamp_source,
+            "system_timestamp_utc": to_utc_iso(system_sampled_at),
+            "monotonic_seconds": f"{time.monotonic():.3f}",
+            "boot_id": self._boot_id,
+            "temperature_c": sample.temperature_c,
+            "humidity_pct": sample.humidity_pct,
+            "pressure_mmhg": sample.pressure_mmhg,
+            "lux": sample.lux,
+            "co2_ppm": sample.co2_ppm,
+            "pm1_0_ug_m3": sample.pm1_0_ug_m3,
+            "pm2_5_ug_m3": sample.pm2_5_ug_m3,
+            "pm10_ug_m3": sample.pm10_ug_m3,
+            "particles_0_3_per_l": sample.particles_0_3_per_l,
+            "particles_0_5_per_l": sample.particles_0_5_per_l,
+            "cpu_temp_c": sample.cpu_temp_c,
+            "errors": "; ".join(sample.errors),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            needs_header = not path.exists() or path.stat().st_size == 0
+            with path.open("a", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=ENVIRONMENT_SAMPLE_FIELDS)
+                if needs_header:
+                    writer.writeheader()
+                writer.writerow(row)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            LOGGER.exception("Raw environmental sample CSV append failed")
 
     def _sample_cpu_only_until(self, duration_seconds: int) -> None:
         deadline = time.monotonic() + duration_seconds
@@ -1327,62 +1967,120 @@ class StationService:
         LOGGER.warning("Pausing audio recording because SD free space is %.1f%% below %.1f%%", free_percent, threshold)
         return True
 
+    def _camera_should_stay_warm(self, now: datetime | None = None) -> bool:
+        now = now or utc_now()
+        local = now.astimezone(self.config.zoneinfo)
+        return (
+            self.config.camera.enabled
+            and self.config.camera.motion_enabled
+            and not self._cooldown_marker_exists()
+            and not self._photo_capture_disabled(local)
+        )
+
+    def _photo_capture_disabled(self, local: datetime) -> bool:
+        if self.config.schedule.photo_capture_disabled_start_hour == self.config.schedule.photo_capture_disabled_end_hour:
+            return False
+        return is_night(
+            local.hour,
+            self.config.schedule.photo_capture_disabled_start_hour,
+            self.config.schedule.photo_capture_disabled_end_hour,
+        )
+
+    def _photo_rate_limited(self, source: str, local_trigger: datetime) -> bool:
+        limit = int(self.config.camera.max_photos_per_minute)
+        if limit <= 0:
+            return False
+        now = time.monotonic()
+        if self._photo_paused_until_monotonic is not None:
+            if now < self._photo_paused_until_monotonic:
+                LOGGER.warning(
+                    "Ignoring %s photo trigger at %s because photo capture is paused after a burst",
+                    source,
+                    local_trigger.isoformat(),
+                )
+                return True
+            self._photo_paused_until_monotonic = None
+
+        cutoff = now - 60.0
+        self._recent_photo_triggers = [value for value in self._recent_photo_triggers if value >= cutoff]
+        if len(self._recent_photo_triggers) >= limit:
+            pause_seconds = max(1, int(self.config.camera.photo_rate_pause_seconds))
+            self._photo_paused_until_monotonic = now + pause_seconds
+            LOGGER.warning(
+                "Photo trigger burst hit %s photos/minute; pausing captures for %s seconds",
+                limit,
+                pause_seconds,
+            )
+            return True
+        self._recent_photo_triggers.append(now)
+        return False
+
+    def _sync_camera_window(self, now: datetime, force_refresh: bool = False) -> None:
+        if not (self.config.camera.enabled and self.config.camera.motion_enabled):
+            return
+        if not self._capture_lock.acquire(blocking=False):
+            return
+        try:
+            if self._camera_should_stay_warm(now):
+                try:
+                    if force_refresh or self._camera_warm_refresh_due(now):
+                        self.camera.restart()
+                        self._last_camera_warm_restart_at = now
+                        LOGGER.info("Camera warm stream refreshed during photo window")
+                    elif self._last_camera_warm_restart_at is None:
+                        self.camera.start()
+                        self._last_camera_warm_restart_at = now
+                    self.camera.apply_mode(self._current_day_camera_mode())
+                except Exception:
+                    self._last_camera_warm_restart_at = None
+                    self.store.add_interval_error(
+                        floor_time(now, self.config.schedule.interval_seconds),
+                        "Camera Connection",
+                        source="camera",
+                    )
+                    LOGGER.exception("Camera warmup failed during enabled photo window")
+            else:
+                try:
+                    self.camera.close()
+                    self._last_camera_warm_restart_at = None
+                except Exception:
+                    LOGGER.exception("Camera close failed during disabled photo window")
+        finally:
+            self._capture_lock.release()
+
+    def _camera_warm_refresh_due(self, now: datetime) -> bool:
+        interval = int(self.config.camera.warm_restart_interval_seconds)
+        if interval <= 0:
+            return self._last_camera_warm_restart_at is None
+        if self._last_camera_warm_restart_at is None:
+            return True
+        return (now - self._last_camera_warm_restart_at).total_seconds() >= interval
+
+    def _photo_ai_deferred(self, photo_local: datetime, now_local: datetime) -> bool:
+        if not self.config.schedule.image_ai_defer_enabled:
+            return False
+        photo_in_defer_window = is_night(
+            photo_local.hour,
+            self.config.schedule.image_ai_defer_start_hour,
+            self.config.schedule.image_ai_defer_end_hour,
+        )
+        now_in_defer_window = is_night(
+            now_local.hour,
+            self.config.schedule.image_ai_defer_start_hour,
+            self.config.schedule.image_ai_defer_end_hour,
+        )
+        return photo_in_defer_window and now_in_defer_window
+
     def _audio_path(self, period_start: datetime) -> Path:
         local = period_start.astimezone(self.config.zoneinfo)
         return self.paths.recordings_dir / local.strftime("%Y-%m-%d") / f"{local.strftime('%Y%m%d_%H%M%S')}.wav"
 
-    def _capture_due_scheduled_photos(self, period_start: datetime, period_end: datetime) -> set[date_type]:
-        if not self.config.camera.enabled:
-            return set()
-        changed_days: set[date_type] = set()
-        local_start = period_start.astimezone(self.config.zoneinfo)
-        local_end = period_end.astimezone(self.config.zoneinfo)
-        for scheduled_local in _scheduled_datetimes_in_interval(
-            local_start,
-            local_end,
-            self.config.camera.scheduled_capture_times,
-        ):
-            slot_key = scheduled_local.strftime("%Y-%m-%dT%H:%M:%S")
-            if self.store.photo_event_exists(slot_key):
-                continue
-            path = self._photo_path(scheduled_local)
-            result = self.camera.capture(path, self.config.camera.day)
-            saved_path = str(result.path) if result.status == "kept" else None
-            self.store.record_photo_event(
-                period_start,
-                slot_key,
-                result.captured_at,
-                saved_path,
-                result.status,
-                result.error,
-            )
-            if result.status != "kept":
-                self.store.add_interval_error(
-                    period_start,
-                    "Camera Capture Failed",
-                    source="camera",
-                    details=result.error,
-                )
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            changed_days.add(period_start.astimezone(self.config.zoneinfo).date())
-        return changed_days
-
-    def _photo_path(self, scheduled_local: datetime) -> Path:
-        base_dir = self.paths.photos_dir
+    def _photo_path(self, triggered_at: datetime, photo_id: int) -> Path:
+        local = triggered_at.astimezone(self.config.zoneinfo)
+        filename = f"{local.strftime('%Y%m%d_%H%M%S')}_pic{photo_id:03d}.jpg"
         if self.config.storage.photo_date_subdirs:
-            base_dir = base_dir / scheduled_local.strftime("%Y-%m-%d")
-        index = self._next_photo_index(scheduled_local, base_dir)
-        timestamp = scheduled_local.strftime("%Y%m%d_%H%M%S")
-        return base_dir / f"{timestamp}_pic{index}.jpg"
-
-    def _next_photo_index(self, scheduled_local: datetime, base_dir: Path) -> int:
-        base_dir.mkdir(parents=True, exist_ok=True)
-        prefix = scheduled_local.strftime("%Y%m%d")
-        existing = sorted(base_dir.glob(f"{prefix}_*_pic*.jpg"))
-        return len(existing) + 1
+            return self.paths.photos_dir / local.strftime("%Y-%m-%d") / filename
+        return self.paths.photos_dir / filename
 
 
 def floor_time(value: datetime, interval_seconds: int) -> datetime:
@@ -1390,6 +2088,104 @@ def floor_time(value: datetime, interval_seconds: int) -> datetime:
     epoch = int(value.timestamp())
     floored = epoch - (epoch % interval_seconds)
     return datetime.fromtimestamp(floored, tz=UTC)
+
+
+def next_scheduled_capture(now_local: datetime, scheduled_times: list[str]) -> datetime:
+    if now_local.tzinfo is None:
+        raise ValueError("now_local must be timezone-aware")
+    candidates = []
+    for scheduled_time in scheduled_times:
+        hour, minute = _parse_scheduled_time(scheduled_time)
+        candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now_local:
+            candidate += timedelta(days=1)
+        candidates.append(candidate)
+    if not candidates:
+        raise ValueError("At least one scheduled capture time is required")
+    return min(candidates)
+
+
+def _hour_in_window(hour: int, start_hour: int, end_hour: int) -> bool:
+    hour %= 24
+    start_hour %= 24
+    end_hour %= 24
+    if start_hour == end_hour:
+        return True
+    if start_hour < end_hour:
+        return start_hour <= hour < end_hour
+    return hour >= start_hour or hour < end_hour
+
+
+def _parse_camera_scan_candidates(values: list[str]) -> list[CameraModeConfig]:
+    candidates = []
+    for value in values:
+        try:
+            exposure_text, gain_text = str(value).split(":", 1)
+            exposure_us = int(float(exposure_text))
+            analogue_gain = float(gain_text)
+        except (TypeError, ValueError):
+            LOGGER.warning("Ignoring invalid day camera scan candidate %r; expected exposure_us:gain", value)
+            continue
+        if exposure_us <= 0 or analogue_gain <= 0:
+            LOGGER.warning("Ignoring invalid day camera scan candidate %r; values must be positive", value)
+            continue
+        candidates.append(CameraModeConfig(exposure_us=exposure_us, analogue_gain=analogue_gain))
+    return candidates
+
+
+def _cap_camera_scan_candidates(candidates: list[CameraModeConfig], max_exposure_us: int) -> list[CameraModeConfig]:
+    max_exposure_us = max(1, int(max_exposure_us))
+    capped = []
+    seen: set[tuple[int | None, float | None, str | None]] = set()
+    for mode in candidates:
+        exposure_us = mode.exposure_us
+        if exposure_us is not None and exposure_us > max_exposure_us:
+            LOGGER.warning(
+                "Clamping day camera scan candidate exposure from %sus to configured maximum %sus",
+                exposure_us,
+                max_exposure_us,
+            )
+            exposure_us = max_exposure_us
+        next_mode = CameraModeConfig(exposure_us=exposure_us, analogue_gain=mode.analogue_gain, denoise=mode.denoise)
+        key = (next_mode.exposure_us, next_mode.analogue_gain, next_mode.denoise)
+        if key in seen:
+            continue
+        seen.add(key)
+        capped.append(next_mode)
+    return capped
+
+
+def _day_camera_scan_score(
+    mode: CameraModeConfig,
+    mean_luma: float,
+    stddev_luma: float,
+    dark_pct: float,
+    bright_pct: float,
+    target_luma: float,
+) -> float:
+    exposure_us = float(mode.exposure_us or 0)
+    gain = float(mode.analogue_gain or 1.0)
+    brightness_penalty = abs(mean_luma - target_luma)
+    clipping_penalty = (dark_pct * 1.2) + (bright_pct * 4.0)
+    speed_penalty = (exposure_us / 1000.0) * 0.45
+    gain_penalty = gain * 1.6
+    contrast_bonus = min(25.0, stddev_luma) * 0.15
+    return brightness_penalty + clipping_penalty + speed_penalty + gain_penalty - contrast_bonus
+
+
+def _speciesnet_failure_is_terminal(exc: Exception) -> bool:
+    if isinstance(exc, (SpeciesNetTimeoutError, SpeciesNetUnavailableError)):
+        return True
+    text = str(exc).lower()
+    terminal_tokens = (
+        "classifier memory guard",
+        "std::bad_alloc",
+        "memoryerror",
+        "out of memory",
+        "cannot allocate memory",
+        "killed",
+    )
+    return any(token in text for token in terminal_tokens)
 
 
 def _audio_error_is_microphone_connection(error: str | None) -> bool:
@@ -1407,38 +2203,15 @@ def _audio_error_is_microphone_connection(error: str | None) -> bool:
     return any(token in text for token in tokens)
 
 
-def _scheduled_datetimes_in_interval(
-    local_start: datetime,
-    local_end: datetime,
-    scheduled_times: list[str],
-) -> list[datetime]:
-    output: list[datetime] = []
-    candidate_days = {local_start.date(), local_end.date()}
-    for day in sorted(candidate_days):
-        for value in scheduled_times:
-            parsed = _parse_scheduled_time(value)
-            if parsed is None:
-                LOGGER.warning("Ignoring invalid scheduled capture time: %r", value)
-                continue
-            hour, minute = parsed
-            candidate = datetime.combine(day, datetime.min.time(), tzinfo=local_start.tzinfo).replace(
-                hour=hour,
-                minute=minute,
-            )
-            if local_start <= candidate < local_end:
-                output.append(candidate)
-    return sorted(output)
-
-
-def _parse_scheduled_time(value: str) -> tuple[int, int] | None:
+def _parse_scheduled_time(value: str) -> tuple[int, int]:
     try:
-        hour_text, minute_text = str(value).strip().split(":", 1)
+        hour_text, minute_text = value.split(":", 1)
         hour = int(hour_text)
         minute = int(minute_text)
-    except (TypeError, ValueError):
-        return None
+    except ValueError as exc:
+        raise ValueError(f"Invalid scheduled capture time: {value!r}") from exc
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        return None
+        raise ValueError(f"Invalid scheduled capture time: {value!r}")
     return hour, minute
 
 

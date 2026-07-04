@@ -1,11 +1,8 @@
 [Unit]
-Description=Reboot the Juara station at planned daily checkpoints
+Description=Reboot the Juara station every day at 3 AM
 
 [Timer]
-OnCalendar=*-*-* 00:00:00
-OnCalendar=*-*-* 04:00:00
-OnCalendar=*-*-* 12:00:00
-OnCalendar=*-*-* 20:00:00
+OnCalendar=*-*-* 03:00:00
 Persistent=true
 Unit=juara-daily-reboot.service
 

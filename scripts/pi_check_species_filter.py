@@ -33,7 +33,7 @@ EXPECTED = [
 
 def main() -> int:
     cfg.LABELS = read_lines(cfg.BIRDNET_LABELS_FILE)
-    species = get_species_list(-17.10211, -56.94487, 18, 0.005)
+    species = get_species_list(-17.102778, -56.941639, 18, 0.005)
     common_names = {item.split("_", 1)[1] if "_" in item else item for item in species}
     print(f"species list count: {len(species)}")
     for name in EXPECTED:

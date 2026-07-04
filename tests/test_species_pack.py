@@ -30,7 +30,7 @@ def test_species_pack_selects_four_nearest_cells_without_regions(tmp_path: Path)
     }.items():
         (pack / "cells" / f"{name}.txt").write_text(species)
 
-    species, selection = build_species_list_from_pack(pack, -17.102778, -56.941639)
+    species, selection = build_species_list_from_pack(pack, -17.102778, -56.941639, cells_without_region=4)
 
     assert len(selection.cell_files) == 4
     assert selection.cell_files == ("cells/a.txt", "cells/b.txt", "cells/c.txt", "cells/d.txt")
@@ -49,10 +49,10 @@ def test_species_pack_writes_active_list_and_metadata(tmp_path: Path):
     (pack / "cells" / "a.txt").write_text("Only bird\n")
     output = tmp_path / "active.txt"
 
-    selection = write_active_species_list(pack, output, 0.1, 0.1)
+    selection = write_active_species_list(pack, output, 0.1, 0.1, cells_without_region=1)
 
     assert output.read_text() == "Only bird\n"
     assert selection.species_count == 1
     metadata = json.loads(output.with_suffix(".txt.metadata.json").read_text())
-    assert metadata["nearest_cell_count"] == 4
-    assert "region_key" not in metadata
+    assert metadata["region_key"] is None
+    assert metadata["cell_files"] == ["cells/a.txt"]

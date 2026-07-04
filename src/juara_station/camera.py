@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import logging
+import shutil
+import subprocess
 import time
 
 from .config import CameraConfig, CameraModeConfig
@@ -16,152 +19,330 @@ LOGGER = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class CaptureResult:
-    path: Path
+    path: Path | None
     captured_at: datetime
     status: str
     error: str | None = None
 
 
-class Camera:
-    def capture(self, path: Path, mode: CameraModeConfig) -> CaptureResult:
-        raise NotImplementedError
+class Flash:
+    def on(self) -> None:
+        pass
+
+    def off(self) -> None:
+        pass
 
     def close(self) -> None:
-        return None
+        self.off()
 
 
-class MockCamera(Camera):
-    def capture(self, path: Path, mode: CameraModeConfig) -> CaptureResult:  # noqa: ARG002
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"\xff\xd8\xff\xe0mock-jpeg\xff\xd9")
-        return CaptureResult(path, utc_now(), "kept")
+class GpioFlash(Flash):
+    def __init__(self, pin: int):
+        from gpiozero import LED
+
+        self._led = LED(pin)
+
+    def on(self) -> None:
+        self._led.on()
+
+    def off(self) -> None:
+        self._led.off()
+
+    def close(self) -> None:
+        self._led.close()
+
+
+class Camera:
+    def start(self) -> None:
+        pass
+
+    def apply_mode(self, mode: CameraModeConfig) -> None:
+        pass
+
+    def capture_at(self, path: Path, target_monotonic_ns: int, mode: CameraModeConfig) -> CaptureResult:
+        raise NotImplementedError
+
+    def restart(self) -> None:
+        self.close()
+        self.start()
+
+    def close(self) -> None:
+        pass
 
 
 class PiCamera2Camera(Camera):
-    """Picamera2 still capture tuned for the Arducam OV5647 day/night module."""
-
     def __init__(self, config: CameraConfig):
         self.config = config
         self._picam2 = None
 
-    def capture(self, path: Path, mode: CameraModeConfig) -> CaptureResult:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self._start()
-            self._apply_mode(mode)
-            warmup = max(0.0, float(self.config.warmup_seconds))
-            if warmup:
-                time.sleep(warmup)
-            self._capture_with_timeout(path)
-            return CaptureResult(path, utc_now(), "kept")
-        except Exception as exc:
-            LOGGER.exception("Scheduled camera capture failed")
-            self.close()
-            return CaptureResult(path, utc_now(), "error", str(exc))
-        finally:
-            self.close()
-
-    def _start(self) -> None:
+    def start(self) -> None:
         if self._picam2 is not None:
             return
         from picamera2 import Picamera2
 
         picam2 = Picamera2()
-        config = picam2.create_still_configuration(
+        warm_config = picam2.create_preview_configuration(
             main={"size": (self.config.width, self.config.height), "format": "RGB888"},
-            buffer_count=2,
+            raw=None,
+            buffer_count=4,
+            queue=False,
         )
-        picam2.configure(config)
-        picam2.options["quality"] = max(1, min(100, int(self.config.jpeg_quality)))
+        picam2.configure(warm_config)
         picam2.start()
+        time.sleep(2.0)
         self._picam2 = picam2
 
-    def _apply_mode(self, mode: CameraModeConfig) -> None:
-        if self._picam2 is None:
-            return
-        controls: dict[str, object] = {"AwbEnable": True}
+    def capture_at(self, path: Path, target_monotonic_ns: int, mode: CameraModeConfig) -> CaptureResult:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            started_before_trigger = self._picam2 is not None
+            if not started_before_trigger:
+                LOGGER.warning("Camera was cold at capture request; starting camera before photo")
+            self.start()
+            assert self._picam2 is not None
+            self.apply_mode(mode)
+            delay = max(0, (target_monotonic_ns - time.monotonic_ns()) / 1_000_000_000)
+            if delay:
+                time.sleep(delay)
+            while time.monotonic_ns() < target_monotonic_ns:
+                time.sleep(min(0.01, (target_monotonic_ns - time.monotonic_ns()) / 1_000_000_000))
+            capture_start = time.monotonic()
+            result = self._capture_once_with_timeout(path)
+            LOGGER.info(
+                "Camera capture completed warm=%s capture_call_seconds=%.3f path=%s",
+                started_before_trigger,
+                time.monotonic() - capture_start,
+                path,
+            )
+            return result
+        except Exception as exc:
+            first_error = str(exc)
+            LOGGER.warning("Camera capture failed; restarting camera for future triggers", exc_info=True)
+            try:
+                self.close()
+                self.start()
+            except Exception as restart_exc:
+                self.close()
+                return CaptureResult(
+                    path,
+                    utc_now(),
+                    "error",
+                    f"capture failed: {first_error}; restart after failure also failed: {restart_exc}",
+                )
+            return CaptureResult(path, utc_now(), "error", f"capture failed: {first_error}; camera restarted")
+
+    def _capture_once_with_timeout(self, path: Path) -> CaptureResult:
+        timeout = max(1.0, float(self.config.capture_timeout_seconds))
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="juara-camera-capture")
+        future = executor.submit(self._capture_once, path)
+        try:
+            result = future.result(timeout=timeout)
+            executor.shutdown(wait=False, cancel_futures=True)
+            return result
+        except FutureTimeoutError as exc:
+            LOGGER.warning("Camera capture timed out after %.1fs; closing camera to recover", timeout)
+            try:
+                self.close()
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
+            raise TimeoutError(f"camera capture timed out after {timeout:.1f}s") from exc
+        except Exception:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+
+    def _capture_once(self, path: Path) -> CaptureResult:
+        assert self._picam2 is not None
+        request = self._picam2.capture_request(flush=False)
+        try:
+            captured_at = utc_now()
+            request.save("main", str(path))
+            return CaptureResult(path, captured_at, "captured")
+        finally:
+            request.release()
+
+    def apply_mode(self, mode: CameraModeConfig) -> None:
+        assert self._picam2 is not None
+        controls: dict[str, object] = {}
+        max_exposure_us = self._effective_max_exposure_us(mode)
         if mode.auto_exposure:
             controls["AeEnable"] = True
-            controls["ExposureValue"] = float(mode.exposure_value)
-            controls["FrameDurationLimits"] = (1000, max(1000, int(mode.max_exposure_us)))
+            controls["FrameDurationLimits"] = self._frame_duration_limits(max_exposure_us)
+            if mode.exposure_value is not None:
+                controls["ExposureValue"] = float(mode.exposure_value)
         else:
-            controls["AeEnable"] = False
+            if mode.exposure_us is not None or mode.analogue_gain is not None:
+                controls["AeEnable"] = False
             if mode.exposure_us is not None:
-                controls["ExposureTime"] = max(1, min(int(mode.exposure_us), int(mode.max_exposure_us)))
+                exposure_us = int(mode.exposure_us)
+                if exposure_us > max_exposure_us:
+                    LOGGER.warning(
+                        "Clamping camera exposure from %sus to configured maximum %sus",
+                        exposure_us,
+                        max_exposure_us,
+                    )
+                    exposure_us = max_exposure_us
+                controls["ExposureTime"] = exposure_us
             if mode.analogue_gain is not None:
-                controls["AnalogueGain"] = max(1.0, float(mode.analogue_gain))
-        awb_enum = _awb_mode(mode.awb_mode)
-        if awb_enum is not None:
-            controls["AwbMode"] = awb_enum
-        denoise_enum = _noise_reduction_mode(mode.denoise)
-        if denoise_enum is not None:
-            controls["NoiseReductionMode"] = denoise_enum
-        self._picam2.set_controls(controls)
+                controls["AnalogueGain"] = float(mode.analogue_gain)
+        if mode.denoise:
+            noise_reduction = _noise_reduction_control(mode.denoise)
+            if noise_reduction is not None:
+                controls["NoiseReductionMode"] = noise_reduction
+        if controls:
+            self._picam2.set_controls(controls)
 
-    def _capture_with_timeout(self, path: Path) -> None:
-        assert self._picam2 is not None
-        timeout = max(1.0, float(self.config.capture_timeout_seconds))
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="jaguar-camera-capture")
-        future = executor.submit(self._picam2.capture_file, str(path))
+    def _effective_max_exposure_us(self, mode: CameraModeConfig | None = None) -> int:
+        configured = mode.max_exposure_us if mode and mode.max_exposure_us is not None else self.config.max_exposure_us
+        max_exposure_us = max(1, int(configured))
+        exposure_range = self._camera_control_range("ExposureTime")
+        if exposure_range is not None:
+            max_exposure_us = min(max_exposure_us, max(1, int(exposure_range[1])))
+        return max_exposure_us
+
+    def _frame_duration_limits(self, max_exposure_us: int) -> tuple[int, int]:
+        frame_range = self._camera_control_range("FrameDurationLimits")
+        if frame_range is None:
+            return (100, max_exposure_us)
+        minimum = max(1, int(frame_range[0]))
+        maximum = min(max_exposure_us, int(frame_range[1]))
+        if maximum < minimum:
+            minimum = maximum
+        return (minimum, maximum)
+
+    def _camera_control_range(self, name: str):
         try:
-            future.result(timeout=timeout)
-        except TimeoutError as exc:
-            raise TimeoutError(f"camera capture timed out after {timeout:.1f}s") from exc
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            return self._picam2.camera_controls.get(name)
+        except Exception:
+            return None
 
     def close(self) -> None:
-        if self._picam2 is None:
-            return
-        try:
-            self._picam2.stop()
-        except Exception:
-            pass
-        try:
+        if self._picam2 is not None:
             self._picam2.close()
-        except Exception:
-            pass
-        self._picam2 = None
+            self._picam2 = None
+
+
+class RpicamStillCamera(Camera):
+    def __init__(self, config: CameraConfig):
+        self.config = config
+        self._command = shutil.which("rpicam-still") or shutil.which("libcamera-still")
+        if self._command is None:
+            raise RuntimeError("rpicam-still/libcamera-still is not installed")
+
+    def start(self) -> None:
+        return
+
+    def capture_at(self, path: Path, target_monotonic_ns: int, mode: CameraModeConfig) -> CaptureResult:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        delay = max(0, (target_monotonic_ns - time.monotonic_ns()) / 1_000_000_000)
+        if delay:
+            time.sleep(delay)
+        while time.monotonic_ns() < target_monotonic_ns:
+            time.sleep(min(0.01, (target_monotonic_ns - time.monotonic_ns()) / 1_000_000_000))
+        command = [
+            self._command,
+            "-n",
+            "--immediate",
+            "--width",
+            str(self.config.width),
+            "--height",
+            str(self.config.height),
+            "-o",
+            str(path),
+        ]
+        if mode.exposure_us is not None and not mode.auto_exposure:
+            max_exposure_us = mode.max_exposure_us if mode.max_exposure_us is not None else self.config.max_exposure_us
+            command.extend(["--shutter", str(min(int(mode.exposure_us), int(max_exposure_us)))])
+        if mode.analogue_gain is not None and not mode.auto_exposure:
+            command.extend(["--gain", str(float(mode.analogue_gain))])
+        if mode.denoise:
+            command.extend(["--denoise", mode.denoise])
+        captured_at = utc_now()
+        try:
+            subprocess.run(command, check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            return CaptureResult(path, captured_at, "captured")
+        except subprocess.CalledProcessError as exc:
+            return CaptureResult(path, captured_at, "error", (exc.stderr or str(exc)).strip())
+        except Exception as exc:
+            return CaptureResult(path, captured_at, "error", str(exc))
+
+
+class MockCamera(Camera):
+    def start(self) -> None:
+        return
+
+    def capture_at(self, path: Path, target_monotonic_ns: int, mode: CameraModeConfig) -> CaptureResult:
+        delay = max(0, (target_monotonic_ns - time.monotonic_ns()) / 1_000_000_000)
+        if delay:
+            time.sleep(delay)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_tiny_jpeg())
+        return CaptureResult(path, utc_now(), "captured")
+
+
+class MotionWatcher:
+    def __init__(self, pin: int, callback):
+        self.pin = pin
+        self.callback = callback
+        self._sensor = None
+
+    def start(self) -> None:
+        from gpiozero import MotionSensor
+
+        self._sensor = MotionSensor(self.pin)
+        self._sensor.when_motion = self.callback
+
+    def close(self) -> None:
+        if self._sensor is not None:
+            self._sensor.close()
 
 
 def create_camera(config: CameraConfig, mock: bool = False) -> Camera:
     if mock or not config.enabled:
         return MockCamera()
+    if config.backend == "rpicam":
+        return RpicamStillCamera(config)
     if config.backend == "picamera2":
         return PiCamera2Camera(config)
     raise ValueError(f"Unsupported camera backend: {config.backend}")
 
 
-def _awb_mode(value: str):
+def create_flash(config: CameraConfig, mock: bool = False) -> Flash:
+    if mock or not config.enabled:
+        return Flash()
     try:
-        from libcamera import controls
+        return GpioFlash(config.flash_gpio)
     except Exception:
-        return None
-    key = str(value or "auto").strip().lower()
-    mapping = {
-        "auto": "Auto",
-        "daylight": "Daylight",
-        "cloudy": "Cloudy",
-        "tungsten": "Tungsten",
-        "fluorescent": "Fluorescent",
-        "indoor": "Indoor",
-    }
-    name = mapping.get(key)
-    return getattr(controls.AwbModeEnum, name, None) if name else None
+        LOGGER.exception("Flash GPIO unavailable; night captures will continue without flash")
+        return Flash()
 
 
-def _noise_reduction_mode(value: str):
+def _noise_reduction_control(name: str):
     try:
         from libcamera import controls
+
+        enum = controls.draft.NoiseReductionModeEnum
+        return {
+            "off": enum.Off,
+            "minimal": enum.Minimal,
+            "fast": enum.Fast,
+            "cdn_fast": enum.Fast,
+            "high_quality": enum.HighQuality,
+            "cdn_hq": enum.HighQuality,
+        }.get(name)
     except Exception:
         return None
-    key = str(value or "").strip().lower()
-    mapping = {
-        "off": "Off",
-        "fast": "Fast",
-        "cdn_fast": "Fast",
-        "high_quality": "HighQuality",
-        "cdn_hq": "HighQuality",
-    }
-    name = mapping.get(key)
-    return getattr(controls.draft.NoiseReductionModeEnum, name, None) if name else None
+
+
+def _tiny_jpeg() -> bytes:
+    return bytes.fromhex(
+        "ffd8ffe000104a46494600010101006000600000ffdb004300"
+        "0302020302020303030304030304050805050404050a07070608"
+        "0c0a0c0c0b0a0b0b0d0e12100d0e110e0b0b10161011131415"
+        "15150c0f171816141812141514ffdb0043010304040504050905"
+        "0509140d0b0d1414141414141414141414141414141414141414"
+        "1414141414141414141414141414141414141414141414141414"
+        "141414141414141414ffc0001108000100010301220002110103"
+        "1101ffc400140001000000000000000000000000000000000000"
+        "0008ffc400141001000000000000000000000000000000000000"
+        "0000ffda000c03010002110311003f00b2c001ffd9"
+    )

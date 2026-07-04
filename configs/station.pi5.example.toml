@@ -28,16 +28,16 @@ post_audio_reboot_command = "/usr/bin/sudo -n /usr/sbin/reboot"
 image_ai_defer_enabled = false
 image_ai_defer_start_hour = 18
 image_ai_defer_end_hour = 8
-photo_capture_disabled_start_hour = 19
-photo_capture_disabled_end_hour = 6
+photo_capture_disabled_start_hour = 0
+photo_capture_disabled_end_hour = 0
 photo_processing_deadline_hour = 6
 motion_capture_delay_seconds = 0.0
 flash_after_capture_seconds = 0.5
 
 [camera]
-enabled = true
+enabled = false
 backend = "picamera2"
-motion_enabled = true
+motion_enabled = false
 scheduled_capture_times = []
 width = 1920
 height = 1080
@@ -50,15 +50,7 @@ day_scan_interval_seconds = 1800
 day_scan_start_hour = 6
 day_scan_end_hour = 19
 day_scan_target_luma = 85.0
-day_scan_candidates = [
-  "3000:1.0",
-  "5000:1.0",
-  "5000:2.0",
-  "8000:2.0",
-  "10000:4.0",
-  "15000:4.0",
-  "20000:4.0",
-]
+day_scan_candidates = []
 
 [camera.day]
 auto_exposure = true
@@ -71,7 +63,7 @@ denoise = "cdn_fast"
 
 [audio]
 enabled = true
-device = "plughw:1,0"
+device = "plughw:CARD=Device,DEV=0"
 record_command = "arecord"
 mixer_command = "amixer"
 capture_gain_percent = 100
@@ -92,6 +84,8 @@ channels = 1
 enabled = true
 bme280_address = 0x76
 veml7700_address = 0x10
+scd41_enabled = true
+scd41_address = 0x62
 
 [time]
 gps_command = "gpspipe"
@@ -108,8 +102,6 @@ species_list_path = "/etc/juara-birdnet-species-list.txt"
 run_in_station_service = false
 use_subprocess = false
 prewarm_at_start = true
-# Optional: set to another Python executable if AI needs a separate venv.
-# python = "/opt/juara-wildlife-station/.venv/bin/python"
 process_inline = false
 batch_min_files = 1
 batch_max_files = 1
@@ -133,10 +125,6 @@ sf_threshold = 0.005
 [speciesnet]
 enabled = false
 backend = "speciesnet"
-# Optional: set to another Python executable if AI needs a separate venv.
-# python = "/opt/juara-wildlife-station/.venv/bin/python"
-model_path = "/home/juara2026pi1/.cache/kagglehub/models/google/speciesnet/pyTorch/v4.0.2a/1"
-target_species_txt = "/etc/juara-speciesnet-target-species.txt"
 run_in_station_service = false
 classifier_only = true
 direct_classifier = true

@@ -136,6 +136,13 @@ cat >/etc/default/juara-gdrive-sync <<'ENV'
 JUARA_LOCAL_ROOT=/mnt/juara_usb/juara
 JUARA_GDRIVE_REMOTE=juara-gdrive
 JUARA_GDRIVE_DIR=Juara Sensor/pi4
+JUARA_GDRIVE_TRANSFERS=1
+JUARA_GDRIVE_CHECKERS=2
+JUARA_GDRIVE_RETRIES=8
+JUARA_GDRIVE_LOW_LEVEL_RETRIES=30
+JUARA_GDRIVE_RETRIES_SLEEP=2m
+JUARA_GDRIVE_CONNECT_TIMEOUT=60s
+JUARA_GDRIVE_IO_TIMEOUT=10m
 ENV
 cat >/etc/systemd/system/juara-gdrive-sync.service <<SERVICE
 [Unit]
@@ -149,6 +156,7 @@ User=$SERVICE_USER
 Group=$SERVICE_USER
 EnvironmentFile=-/etc/default/juara-gdrive-sync
 ExecStart=/usr/local/bin/juara_gdrive_sync
+TimeoutStartSec=6h
 SERVICE
 cat >/etc/systemd/system/juara-gdrive-sync.timer <<'TIMER'
 [Unit]

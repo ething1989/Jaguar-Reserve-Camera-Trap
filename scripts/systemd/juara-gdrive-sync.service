@@ -11,3 +11,4 @@ Environment=JUARA_LOCAL_ROOT=/mnt/juara_usb/juara
 Environment=JUARA_GDRIVE_REMOTE=juara-gdrive
 Environment=JUARA_GDRIVE_DIR=Julice Station/pi5
 ExecStart=/usr/local/bin/juara_gdrive_sync
+TimeoutStartSec=6h

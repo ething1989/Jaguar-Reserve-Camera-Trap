@@ -214,11 +214,13 @@ class BirdNetConfig:
 @dataclass(frozen=True)
 class YamNetConfig:
     enabled: bool = False
+    python: str | None = None
     model_path: str | None = None
     class_map_path: str | None = None
     ffmpeg_command: str = "ffmpeg"
     min_confidence: float = 0.15
     top_k: int = 8
+    subprocess_timeout_seconds: int = 600
 
 
 @dataclass(frozen=True)

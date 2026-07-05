@@ -3,7 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import csv
+import json
+import os
 import subprocess
+import sys
 
 from .config import YamNetConfig
 from .storage import SoundDetection
@@ -46,6 +49,8 @@ class YamNetRunner:
         model_path = Path(self.config.model_path).expanduser() if self.config.model_path else None
         if model_path is None or not model_path.exists():
             raise RuntimeError("YAMNet model_path is not configured or does not exist")
+        if self.config.python and Path(self.config.python).expanduser() != Path(sys.executable):
+            return self._analyze_subprocess(audio_path, model_path)
 
         labels = self._class_labels()
         waveform = _load_audio_as_16khz_float32(audio_path, self.config.ffmpeg_command)
@@ -56,6 +61,45 @@ class YamNetRunner:
         detections = _scores_to_detections(scores, labels, self.config)
         categories = category_scores(detections)
         return YamNetSummary(detections=detections, category_scores=categories)
+
+    def _analyze_subprocess(self, audio_path: Path, model_path: Path) -> YamNetSummary:
+        command = [
+            str(Path(self.config.python or sys.executable).expanduser()),
+            "-m",
+            "juara_station.yamnet_worker",
+            "--audio",
+            str(audio_path),
+            "--model",
+            str(model_path),
+            "--class-map",
+            str(Path(self.config.class_map_path or "").expanduser()),
+            "--ffmpeg",
+            self.config.ffmpeg_command,
+            "--min-confidence",
+            str(self.config.min_confidence),
+            "--top-k",
+            str(self.config.top_k),
+        ]
+        env = os.environ.copy()
+        source_root = str(Path(__file__).resolve().parents[1])
+        env["PYTHONPATH"] = source_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        proc = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(30, int(self.config.subprocess_timeout_seconds)),
+            env=env,
+        )
+        if proc.returncode != 0:
+            message = (proc.stderr or proc.stdout or f"YAMNet subprocess exited {proc.returncode}").strip()
+            raise RuntimeError(message)
+        payload = json.loads(proc.stdout)
+        detections = [
+            SoundDetection(item["label"], float(item["score"]), source=YAMNET_SOURCE, category=item.get("category"))
+            for item in payload.get("detections", [])
+        ]
+        return YamNetSummary(detections=detections, category_scores=category_scores(detections))
 
     def _class_labels(self) -> list[str]:
         if self._labels is not None:
@@ -98,7 +142,8 @@ class YamNetRunner:
             input_details = interpreter.get_input_details()
             waveform = np.asarray(waveform, dtype=np.float32)
             target_shape = list(input_details[0]["shape"])
-            if -1 in target_shape or target_shape != list(waveform.shape):
+            expected_samples = _tflite_expected_samples(input_details[0])
+            if not expected_samples and (-1 in target_shape or target_shape != list(waveform.shape)):
                 try:
                     interpreter.resize_tensor_input(input_details[0]["index"], waveform.shape, strict=False)
                 except TypeError:
@@ -107,15 +152,27 @@ class YamNetRunner:
             output_details = interpreter.get_output_details()
             self._tflite_interpreter = interpreter
             self._tflite_input_index = input_details[0]["index"]
-            self._tflite_output_index = output_details[0]["index"]
+            self._tflite_output_index = _score_output_index(output_details)
 
         interpreter = self._tflite_interpreter
-        interpreter.set_tensor(self._tflite_input_index, waveform)
-        interpreter.invoke()
-        scores = interpreter.get_tensor(self._tflite_output_index)
+        input_details = interpreter.get_input_details()
+        expected_samples = _tflite_expected_samples(input_details[0])
+        if expected_samples:
+            frame_scores = []
+            input_shape = [int(value) for value in input_details[0].get("shape")]
+            for frame in _fixed_length_frames(np.asarray(waveform, dtype=np.float32), expected_samples):
+                tensor = frame.reshape(input_shape) if len(input_shape) == 2 else frame
+                interpreter.set_tensor(self._tflite_input_index, tensor)
+                interpreter.invoke()
+                frame_scores.append(interpreter.get_tensor(self._tflite_output_index))
+            scores = np.asarray(frame_scores)
+        else:
+            interpreter.set_tensor(self._tflite_input_index, waveform)
+            interpreter.invoke()
+            scores = interpreter.get_tensor(self._tflite_output_index)
         if scores.ndim == 1:
             return scores
-        return scores.max(axis=0)
+        return scores.max(axis=tuple(range(scores.ndim - 1)))
 
 
 class MockYamNetRunner(YamNetRunner):
@@ -164,6 +221,38 @@ def _category_for_label(label: str) -> str | None:
         if any(term in lower for term in terms):
             return category
     return None
+
+
+def _score_output_index(output_details) -> int:
+    for detail in output_details:
+        shape = list(detail.get("shape") or [])
+        if shape and shape[-1] == 521:
+            return detail["index"]
+    return output_details[0]["index"]
+
+
+def _tflite_expected_samples(input_detail) -> int | None:
+    shape = [int(value) for value in input_detail.get("shape") or []]
+    if len(shape) == 1 and shape[0] > 0:
+        return shape[0]
+    if len(shape) == 2 and shape[0] == 1 and shape[1] > 0:
+        return shape[1]
+    return None
+
+
+def _fixed_length_frames(waveform, expected_samples: int):
+    import numpy as np
+
+    waveform = np.asarray(waveform, dtype=np.float32)
+    if waveform.size < expected_samples:
+        yield np.pad(waveform, (0, expected_samples - waveform.size))
+        return
+    step = max(1, expected_samples // 2)
+    for start in range(0, waveform.size - expected_samples + 1, step):
+        yield waveform[start : start + expected_samples]
+    remainder = waveform.size % step
+    if remainder and waveform.size > expected_samples:
+        yield waveform[-expected_samples:]
 
 
 def _load_audio_as_16khz_float32(audio_path: Path, ffmpeg_command: str):

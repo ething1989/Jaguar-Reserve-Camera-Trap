@@ -225,14 +225,16 @@ def _category_for_label(label: str) -> str | None:
 
 def _score_output_index(output_details) -> int:
     for detail in output_details:
-        shape = list(detail.get("shape") or [])
+        shape_value = detail.get("shape")
+        shape = list(shape_value) if shape_value is not None else []
         if shape and shape[-1] == 521:
             return detail["index"]
     return output_details[0]["index"]
 
 
 def _tflite_expected_samples(input_detail) -> int | None:
-    shape = [int(value) for value in input_detail.get("shape") or []]
+    shape_value = input_detail.get("shape")
+    shape = [int(value) for value in shape_value] if shape_value is not None else []
     if len(shape) == 1 and shape[0] > 0:
         return shape[0]
     if len(shape) == 2 and shape[0] == 1 and shape[1] > 0:

@@ -136,6 +136,7 @@ enabled = false
 ffmpeg_command = "ffmpeg"
 min_confidence = 0.15
 top_k = 8
+max_audio_seconds = 30
 subprocess_timeout_seconds = 600
 
 [speciesnet]

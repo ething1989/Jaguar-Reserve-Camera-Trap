@@ -220,6 +220,7 @@ class YamNetConfig:
     ffmpeg_command: str = "ffmpeg"
     min_confidence: float = 0.15
     top_k: int = 8
+    max_audio_seconds: int = 30
     subprocess_timeout_seconds: int = 600
 
 

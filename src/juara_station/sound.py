@@ -53,7 +53,11 @@ class YamNetRunner:
             return self._analyze_subprocess(audio_path, model_path)
 
         labels = self._class_labels()
-        waveform = _load_audio_as_16khz_float32(audio_path, self.config.ffmpeg_command)
+        waveform = _load_audio_as_16khz_float32(
+            audio_path,
+            self.config.ffmpeg_command,
+            max_audio_seconds=self.config.max_audio_seconds,
+        )
         if model_path.suffix == ".tflite":
             scores = self._analyze_tflite(model_path, waveform)
         else:
@@ -79,6 +83,8 @@ class YamNetRunner:
             str(self.config.min_confidence),
             "--top-k",
             str(self.config.top_k),
+            "--max-audio-seconds",
+            str(self.config.max_audio_seconds),
         ]
         env = os.environ.copy()
         source_root = str(Path(__file__).resolve().parents[1])
@@ -257,25 +263,26 @@ def _fixed_length_frames(waveform, expected_samples: int):
         yield waveform[-expected_samples:]
 
 
-def _load_audio_as_16khz_float32(audio_path: Path, ffmpeg_command: str):
+def _load_audio_as_16khz_float32(audio_path: Path, ffmpeg_command: str, max_audio_seconds: int | None = None):
     import numpy as np
 
+    command = [
+        ffmpeg_command,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(audio_path),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+    ]
+    if max_audio_seconds and max_audio_seconds > 0:
+        command.extend(["-t", str(max_audio_seconds)])
+    command.extend(["-f", "f32le", "-"])
     proc = subprocess.run(
-        [
-            ffmpeg_command,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(audio_path),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-f",
-            "f32le",
-            "-",
-        ],
+        command,
         check=False,
         capture_output=True,
         timeout=300,

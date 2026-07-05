@@ -16,6 +16,7 @@ def main() -> int:
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--min-confidence", type=float, default=0.15)
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--max-audio-seconds", type=int, default=30)
     args = parser.parse_args()
 
     config = YamNetConfig(
@@ -25,6 +26,7 @@ def main() -> int:
         ffmpeg_command=args.ffmpeg,
         min_confidence=args.min_confidence,
         top_k=args.top_k,
+        max_audio_seconds=args.max_audio_seconds,
     )
     summary = YamNetRunner(config).analyze_audio(Path(args.audio))
     print(

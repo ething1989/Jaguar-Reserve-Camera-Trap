@@ -215,6 +215,7 @@ class StationService:
 
     def _copy_fallback_outputs_to_usb(self, target_paths: StationPaths) -> None:
         self._copy_fallback_tree_to_usb(self.paths.photos_dir, target_paths.photos_dir, "media")
+        self._copy_fallback_tree_to_usb(self.paths.survey_photos_dir, target_paths.survey_photos_dir, "survey media")
         self._copy_fallback_tree_to_usb(self.paths.logs_dir, target_paths.logs_dir, "logs")
 
     def _copy_fallback_tree_to_usb(self, source_root: Path, target_root: Path, label: str) -> None:
@@ -1581,7 +1582,7 @@ class StationService:
             period_start = floor_time(triggered_at, self.config.schedule.interval_seconds)
             night = self._is_night(local_trigger)
             photo_id = self.store.create_photo_event(period_start, triggered_at, target_at)
-            path = self._photo_path(triggered_at, photo_id)
+            path = self._photo_path(triggered_at, photo_id, source=source)
             target_monotonic_ns = time.monotonic_ns() + int(delay_seconds * 1e9)
             LOGGER.info(
                 "%s photo trigger id=%s trigger=%s target_delay_seconds=%.3f target=%s",
@@ -2097,12 +2098,14 @@ class StationService:
         local = period_start.astimezone(self.config.zoneinfo)
         return self.paths.recordings_dir / local.strftime("%Y-%m-%d") / f"{local.strftime('%Y%m%d_%H%M%S')}.wav"
 
-    def _photo_path(self, triggered_at: datetime, photo_id: int) -> Path:
+    def _photo_path(self, triggered_at: datetime, photo_id: int, source: str = "motion") -> Path:
         local = triggered_at.astimezone(self.config.zoneinfo)
-        filename = f"{local.strftime('%Y%m%d_%H%M%S')}_pic{photo_id:03d}.jpg"
+        prefix = "survey" if source == "scheduled" else "pic"
+        filename = f"{local.strftime('%Y%m%d_%H%M%S')}_{prefix}{photo_id:03d}.jpg"
+        photos_dir = self.paths.survey_photos_dir if source == "scheduled" else self.paths.photos_dir
         if self.config.storage.photo_date_subdirs:
-            return self.paths.photos_dir / local.strftime("%Y-%m-%d") / filename
-        return self.paths.photos_dir / filename
+            return photos_dir / local.strftime("%Y-%m-%d") / filename
+        return photos_dir / filename
 
 
 def floor_time(value: datetime, interval_seconds: int) -> datetime:

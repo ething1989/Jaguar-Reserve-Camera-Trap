@@ -64,7 +64,7 @@ def test_scheduled_photo_is_saved(tmp_path: Path):
 
     service._capture_scheduled_photo(period_start)
 
-    photos = list((tmp_path / "usb" / "Photos").glob("**/*.jpg"))
+    photos = list((tmp_path / "usb" / "media" / "survey_photos").glob("**/*.jpg"))
     assert len(photos) == 1
     rows = service.store.pending_photo_events()
     assert len(rows) == 1
@@ -82,6 +82,7 @@ def test_fallback_sync_copies_logs_and_photos_to_usb(tmp_path: Path):
         recording_root=tmp_path / "recordings",
         logs_subdir=".",
         photos_subdir="Photos",
+        survey_photos_subdir="SurveyPhotos",
         fallback_active=True,
     )
     usb_paths = StationPaths(
@@ -92,13 +93,16 @@ def test_fallback_sync_copies_logs_and_photos_to_usb(tmp_path: Path):
         recording_root=tmp_path / "recordings",
         logs_subdir=".",
         photos_subdir="Photos",
+        survey_photos_subdir="SurveyPhotos",
         fallback_active=False,
     )
     service.paths = fallback_paths
     fallback_paths.logs_dir.mkdir(parents=True)
     fallback_paths.photos_dir.mkdir(parents=True)
+    fallback_paths.survey_photos_dir.mkdir(parents=True)
     (fallback_paths.logs_dir / "juara_environment_samples.csv").write_text("header\none\ntwo\n")
     (fallback_paths.photos_dir / "field.jpg").write_bytes(b"photo")
+    (fallback_paths.survey_photos_dir / "survey.jpg").write_bytes(b"survey")
     usb_paths.logs_dir.mkdir(parents=True, exist_ok=True)
     (usb_paths.logs_dir / "juara_environment_samples.csv").write_text("header\n")
 
@@ -106,3 +110,4 @@ def test_fallback_sync_copies_logs_and_photos_to_usb(tmp_path: Path):
 
     assert (usb_paths.logs_dir / "juara_environment_samples.csv").read_text() == "header\none\ntwo\n"
     assert (usb_paths.photos_dir / "field.jpg").read_bytes() == b"photo"
+    assert (usb_paths.survey_photos_dir / "survey.jpg").read_bytes() == b"survey"

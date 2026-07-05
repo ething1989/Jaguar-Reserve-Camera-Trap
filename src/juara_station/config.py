@@ -29,6 +29,7 @@ class StorageConfig:
     recording_root: Path | None = None
     logs_subdir: str = "logs"
     photos_subdir: str = "media/photos"
+    survey_photos_subdir: str = "media/survey_photos"
     photo_date_subdirs: bool = True
     require_usb: bool = False
     csv_filename: str = "juara_station.csv"

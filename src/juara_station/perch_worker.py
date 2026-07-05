@@ -107,11 +107,14 @@ def _run_tflite_model(model_path: Path, waveform, label_count: int, sample_rate:
     import numpy as np
 
     try:
-        from tflite_runtime.interpreter import Interpreter
+        from ai_edge_litert.interpreter import Interpreter
     except ImportError:
-        from tensorflow.lite import Interpreter
+        try:
+            from tflite_runtime.interpreter import Interpreter
+        except ImportError:
+            from tensorflow.lite import Interpreter
 
-    interpreter = Interpreter(model_path=str(model_path))
+    interpreter = Interpreter(model_path=str(model_path), num_threads=1)
     input_details = interpreter.get_input_details()
     input_detail = input_details[0]
     expected_samples = _expected_samples(input_detail, sample_rate, window_seconds)

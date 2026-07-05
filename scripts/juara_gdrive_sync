@@ -62,6 +62,12 @@ rclone copy "$LOCAL_ROOT" "${REMOTE_NAME}:${REMOTE_DIR}" \
   --contimeout "$CONNECT_TIMEOUT" \
   --timeout "$IO_TIMEOUT" \
   --exclude '/media/audio/**' \
+  --exclude '/.Spotlight-V100/**' \
+  --exclude '/.Trashes/**' \
+  --exclude '/.fseventsd/**' \
+  --exclude '/System Volume Information/**' \
+  --exclude '/$RECYCLE.BIN/**' \
+  --exclude '._*' \
   --exclude '*.wav' \
   --exclude '*.tmp' \
   --exclude '*.part' \

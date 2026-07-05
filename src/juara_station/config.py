@@ -225,6 +225,21 @@ class YamNetConfig:
 
 
 @dataclass(frozen=True)
+class PerchConfig:
+    enabled: bool = False
+    python: str | None = None
+    model_path: str | None = None
+    label_path: str | None = None
+    ffmpeg_command: str = "ffmpeg"
+    min_confidence: float = 0.15
+    top_k: int = 8
+    sample_rate: int = 32000
+    window_seconds: float = 5.0
+    max_audio_seconds: int = 300
+    subprocess_timeout_seconds: int = 900
+
+
+@dataclass(frozen=True)
 class SpeciesNetConfig:
     enabled: bool = True
     backend: str = "speciesnet"
@@ -265,6 +280,7 @@ class StationConfig:
     time: TimeConfig = field(default_factory=TimeConfig)
     birdnet: BirdNetConfig = field(default_factory=BirdNetConfig)
     yamnet: YamNetConfig = field(default_factory=YamNetConfig)
+    perch: PerchConfig = field(default_factory=PerchConfig)
     speciesnet: SpeciesNetConfig = field(default_factory=SpeciesNetConfig)
 
     @property

@@ -131,6 +131,20 @@ ffmpeg_command = "ffmpeg"
 min_confidence = 0.15
 top_k = 8
 
+[perch]
+enabled = false
+# Perch v2 is best installed in its own Python environment.
+# python = "/opt/juara-perch-venv/bin/python"
+# model_path = "/opt/juara-models/perch/perch_v2.tflite"
+# label_path = "/opt/juara-models/perch/labels.csv"
+ffmpeg_command = "ffmpeg"
+min_confidence = 0.15
+top_k = 8
+sample_rate = 32000
+window_seconds = 5.0
+max_audio_seconds = 300
+subprocess_timeout_seconds = 900
+
 [speciesnet]
 enabled = false
 backend = "speciesnet"

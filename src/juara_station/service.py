@@ -34,6 +34,7 @@ from .camera import MotionWatcher, create_camera, create_flash
 from .config import CameraModeConfig, StationConfig, is_night
 from .csv_exporter import CsvExportOptions, export_day_csv
 from .paths import StationPaths, resolve_paths
+from .perch import MockPerchRunner, PERCH_SOURCE, PerchRunner
 from .sensors import MockSensorSuite, SensorSuite, read_cpu_temp
 from .sound import MockYamNetRunner, YAMNET_SOURCE, YamNetRunner
 from .species_pack import write_active_species_list
@@ -80,6 +81,7 @@ class StationService:
         self.flash = create_flash(config.camera, mock=hardware_mock)
         self.birdnet = MockBirdNetRunner() if mock else BirdNetRunner(config.birdnet, config.location)
         self.yamnet = MockYamNetRunner() if mock else YamNetRunner(config.yamnet)
+        self.perch = MockPerchRunner() if mock else PerchRunner(config.perch)
         self.speciesnet = MockSpeciesNetRunner() if mock else SpeciesNetRunner(config.speciesnet, config.location)
         self._capture_lock = Lock()
         self._ai_lock = Lock()
@@ -772,6 +774,13 @@ class StationService:
             except Exception as exc:
                 LOGGER.warning("YAMNet analysis failed for %s: %s", audio_path, exc, exc_info=True)
                 self.store.save_sound_analysis_error(period_start, YAMNET_SOURCE, str(exc))
+        if self.config.perch.enabled or self.mock:
+            try:
+                summary = self.perch.analyze_audio(audio_path)
+                self.store.save_sound_detections(period_start, PERCH_SOURCE, summary.detections)
+            except Exception as exc:
+                LOGGER.warning("Perch analysis failed for %s: %s", audio_path, exc, exc_info=True)
+                self.store.save_sound_analysis_error(period_start, PERCH_SOURCE, str(exc))
 
     def process_audio_event(self, period_start: datetime, audio_path: Path, night: bool) -> None:
         if not audio_path.exists():

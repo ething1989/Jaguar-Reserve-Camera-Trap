@@ -55,6 +55,14 @@ def test_jaguar_csv_has_sensor_co2_photo_and_bird_calls(tmp_path: Path):
             SoundDetection("Frog", 0.41, category="frog"),
         ],
     )
+    store.save_sound_detections(
+        start,
+        "perch",
+        [
+            SoundDetection("Hyacinth macaw", 0.74, source="perch", category="bird"),
+            SoundDetection("Blue-and-yellow macaw", 0.22, source="perch", category="bird"),
+        ],
+    )
     store.upsert_interval_summary(start, end, start, "rtc")
     species_list = tmp_path / "species.txt"
     species_list.write_text(
@@ -92,6 +100,10 @@ def test_jaguar_csv_has_sensor_co2_photo_and_bird_calls(tmp_path: Path):
     assert rows[0]["yamnet_top_label"] == "Bird vocalization, bird call, bird song"
     assert rows[0]["yamnet_bird_score"] == "0.880"
     assert rows[0]["yamnet_frog_score"] == "0.410"
+    assert rows[0]["perch_top_label"] == "Hyacinth macaw"
+    assert rows[0]["perch_bird_score"] == "0.740"
+    assert rows[0]["perch_top_family"] == "Psittacidae(Calls: 2, Support: 74.0%)"
+    assert rows[0]["perch_top_group"] == "macaw(Calls: 2, Support: 74.0%)"
     assert rows[0]["Call 1"] == "Hyacinth macaw (82.0%)\nBlue-and-yellow macaw (14.0%)"
     assert rows[0]["Call 90"] == ""
 

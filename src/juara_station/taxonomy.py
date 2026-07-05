@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import csv
 from functools import lru_cache
 from pathlib import Path
 import re
@@ -17,6 +18,10 @@ class BirdTaxon:
 
 
 RANKS = ("genus", "family", "order", "group")
+
+DEFAULT_TAXONOMY_PATH = (
+    Path(__file__).resolve().parents[2] / "data" / "birdnet" / "ebird_clements_taxonomy_v2025.csv"
+)
 
 
 COMMON_GROUP_RULES: tuple[tuple[tuple[str, ...], str, str | None, str | None], ...] = (
@@ -110,6 +115,76 @@ def normalize_common_name(value: str | None) -> str:
     return re.sub(r"\s+", " ", value.replace("_", " ").strip()).casefold()
 
 
+def normalize_scientific_name(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", value.strip()).casefold()
+
+
+def _merge_taxa(primary: BirdTaxon, fallback: BirdTaxon) -> BirdTaxon:
+    return BirdTaxon(
+        common_name=primary.common_name or fallback.common_name,
+        scientific_name=primary.scientific_name or fallback.scientific_name,
+        genus=primary.genus or fallback.genus,
+        family=primary.family or fallback.family,
+        order=primary.order or fallback.order,
+        group=primary.group or fallback.group,
+    )
+
+
+def _taxonomy_path_key(taxonomy_path: str | None) -> str:
+    path = Path(taxonomy_path).expanduser() if taxonomy_path else DEFAULT_TAXONOMY_PATH
+    return str(path)
+
+
+@lru_cache(maxsize=4)
+def load_ebird_clements_taxa(
+    taxonomy_path: str | None = None,
+) -> tuple[dict[str, BirdTaxon], dict[str, BirdTaxon], dict[str, BirdTaxon]]:
+    path = Path(_taxonomy_path_key(taxonomy_path))
+    if not path.exists():
+        return {}, {}, {}
+
+    by_common: dict[str, BirdTaxon] = {}
+    by_scientific: dict[str, BirdTaxon] = {}
+    genus_candidates: dict[str, set[tuple[str, str]]] = {}
+    genus_examples: dict[str, BirdTaxon] = {}
+
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            common_name = (row.get("common_name") or "").strip()
+            scientific_name = (row.get("scientific_name") or "").strip()
+            genus = (row.get("genus") or "").strip()
+            family = (row.get("family") or "").strip()
+            order = (row.get("order") or "").strip()
+            if not common_name or not genus or not family or not order:
+                continue
+
+            heuristic = infer_taxon_from_common_name(common_name)
+            taxon = BirdTaxon(
+                common_name=common_name,
+                scientific_name=scientific_name or None,
+                genus=genus,
+                family=family,
+                order=order,
+                group=heuristic.group,
+            )
+            by_common.setdefault(normalize_common_name(common_name), taxon)
+            if scientific_name:
+                by_scientific.setdefault(normalize_scientific_name(scientific_name), taxon)
+            genus_key = normalize_scientific_name(genus)
+            genus_candidates.setdefault(genus_key, set()).add((family, order))
+            genus_examples.setdefault(genus_key, taxon)
+
+    by_genus = {
+        genus_key: genus_examples[genus_key]
+        for genus_key, family_orders in genus_candidates.items()
+        if len(family_orders) == 1
+    }
+    return by_common, by_scientific, by_genus
+
+
 @lru_cache(maxsize=16)
 def load_species_taxa(species_list_path: str | None) -> dict[str, BirdTaxon]:
     if not species_list_path:
@@ -140,12 +215,38 @@ def load_species_taxa(species_list_path: str | None) -> dict[str, BirdTaxon]:
     return taxa
 
 
-def resolve_taxon(common_name: str, species_list_path: str | None = None) -> BirdTaxon:
-    taxa = load_species_taxa(str(species_list_path) if species_list_path else None)
-    key = normalize_common_name(common_name)
-    if key in taxa:
-        return taxa[key]
+def resolve_taxon(
+    common_name: str,
+    species_list_path: str | None = None,
+    taxonomy_path: str | None = None,
+) -> BirdTaxon:
+    by_common, by_scientific, by_genus = load_ebird_clements_taxa(_taxonomy_path_key(taxonomy_path))
     inferred = infer_taxon_from_common_name(common_name)
+    key = normalize_common_name(common_name)
+    if key in by_common:
+        return _merge_taxa(by_common[key], inferred)
+
+    taxa = load_species_taxa(str(species_list_path) if species_list_path else None)
+    if key in taxa:
+        species_taxon = taxa[key]
+        if species_taxon.scientific_name:
+            scientific_key = normalize_scientific_name(species_taxon.scientific_name)
+            if scientific_key in by_scientific:
+                return _merge_taxa(by_scientific[scientific_key], inferred)
+        if species_taxon.genus:
+            genus_key = normalize_scientific_name(species_taxon.genus)
+            if genus_key in by_genus:
+                genus_taxon = by_genus[genus_key]
+                return BirdTaxon(
+                    common_name=species_taxon.common_name,
+                    scientific_name=species_taxon.scientific_name,
+                    genus=species_taxon.genus,
+                    family=genus_taxon.family,
+                    order=genus_taxon.order,
+                    group=inferred.group or genus_taxon.group,
+                )
+        return species_taxon
+
     return BirdTaxon(
         common_name=common_name,
         genus=inferred.genus,

@@ -130,6 +130,15 @@ batch_size = 1
 fast_tflite = true
 sf_threshold = 0.005
 
+[yamnet]
+enabled = false
+# Stage a local YAMNet SavedModel directory or .tflite file before enabling.
+# model_path = "/opt/juara-wildlife-station/models/yamnet"
+# class_map_path = "/opt/juara-wildlife-station/models/yamnet_class_map.csv"
+ffmpeg_command = "ffmpeg"
+min_confidence = 0.15
+top_k = 8
+
 [speciesnet]
 enabled = false
 backend = "speciesnet"

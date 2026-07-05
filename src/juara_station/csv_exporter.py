@@ -10,12 +10,16 @@ import csv
 
 from .acoustic_indices import ACOUSTIC_INDEX_COLUMNS
 from .paths import atomic_replace_text
+from .sound import YAMNET_CATEGORY_TERMS
 from .storage import DataStore, from_iso
+from .taxonomy import RANKS as TAXON_RANKS
+from .taxonomy import resolve_taxon, taxon_rank_value
 
 
 MMHG_PER_INHG = 25.4
 MAX_BIRD_CALL_COLUMNS = 90
 CALL_COLUMNS = [f"Call {index}" for index in range(1, MAX_BIRD_CALL_COLUMNS + 1)]
+YAMNET_CATEGORY_COLUMNS = [f"yamnet_{category}_score" for category in YAMNET_CATEGORY_TERMS]
 
 
 @dataclass(frozen=True)
@@ -26,6 +30,7 @@ class CsvExportOptions:
     latitude: float | None = None
     longitude: float | None = None
     interval_seconds: int = 300
+    birdnet_species_list_path: str | None = None
 
 CSV_COLUMNS = [
     "timestamp",
@@ -47,10 +52,23 @@ CSV_COLUMNS = [
     "bird_total_calls",
     "bird_total_species",
     "bird_top_species",
+    "bird_top_genus",
+    "bird_top_genus_support",
+    "bird_top_family",
+    "bird_top_family_support",
+    "bird_top_order",
+    "bird_top_order_support",
+    "bird_top_group",
+    "bird_top_group_support",
     "bird_shannon_index",
     "bird_simpson_index",
     "bird_pielou_evenness",
     *ACOUSTIC_INDEX_COLUMNS,
+    "yamnet_top_label",
+    "yamnet_top_score",
+    "yamnet_top_labels",
+    *YAMNET_CATEGORY_COLUMNS,
+    "yamnet_error",
     "audio_status",
     "bird_calls_truncated",
     *CALL_COLUMNS,
@@ -72,10 +90,23 @@ JUNE_CAMERA_TRAP_COLUMNS = [
     "total_calls",
     "total_species",
     "top_species",
+    "top_genus",
+    "top_genus_support",
+    "top_family",
+    "top_family_support",
+    "top_order",
+    "top_order_support",
+    "top_group",
+    "top_group_support",
     "shannon_index",
     "simpsons_index",
     "pielou_evenness",
     *ACOUSTIC_INDEX_COLUMNS,
+    "yamnet_top_label",
+    "yamnet_top_score",
+    "yamnet_top_labels",
+    *YAMNET_CATEGORY_COLUMNS,
+    "yamnet_error",
     "Audio_status",
     *CALL_COLUMNS,
     "",
@@ -101,9 +132,15 @@ def export_main_csv(
     include_photos: bool = True,
     options: CsvExportOptions | None = None,
 ) -> Path:
+    if isinstance(include_photos, CsvExportOptions) and options is None:
+        options = include_photos
+        include_photos = options.include_photos
     options = options or CsvExportOptions(include_photos=include_photos)
     rows = _coalesce_event_only_rows(store.list_intervals(), options.interval_seconds)
     call_rows_by_interval = _bird_call_rows_by_interval(store)
+    taxon_rollups_by_interval = _bird_taxon_rollups_by_interval(store, options.birdnet_species_list_path)
+    yamnet_by_interval = _yamnet_summaries_by_interval(store)
+    yamnet_errors_by_interval = _yamnet_errors_by_interval(store)
     errors_by_interval = _errors_by_interval(store)
     columns = list(JUNE_CAMERA_TRAP_COLUMNS if options.profile == "june2026trap" else CSV_COLUMNS)
     if not options.include_photos and "photos_taken" in columns:
@@ -115,11 +152,16 @@ def export_main_csv(
     writer.writeheader()
     for row in rows:
         bird_calls = call_rows_by_interval.get(row["period_start_utc"])
+        taxon_rollup = taxon_rollups_by_interval.get(row["period_start_utc"], {})
+        yamnet_summary = yamnet_by_interval.get(row["period_start_utc"], {})
+        yamnet_error = yamnet_errors_by_interval.get(row["period_start_utc"], "")
         interval_errors = errors_by_interval.get(row["period_start_utc"], [])
         if options.profile == "june2026trap":
-            writer.writerow(_row_to_june_csv(row, zone, bird_calls, interval_errors, options))
+            writer.writerow(
+                _row_to_june_csv(row, zone, bird_calls, taxon_rollup, yamnet_summary, yamnet_error, interval_errors, options)
+            )
         else:
-            writer.writerow(_row_to_csv(row, zone, bird_calls))
+            writer.writerow(_row_to_csv(row, zone, bird_calls, taxon_rollup, yamnet_summary, yamnet_error))
     path = logs_dir / options.filename
     atomic_replace_text(path, output.getvalue())
     for old_path in logs_dir.glob("*_juara_station.csv"):
@@ -218,7 +260,14 @@ def _append_csv_events(existing: str | None, event: str | None) -> str:
     return ";".join(parts)
 
 
-def _row_to_csv(row, zone: ZoneInfo, bird_calls: list[dict] | None = None) -> dict[str, str | int | float | None]:
+def _row_to_csv(
+    row,
+    zone: ZoneInfo,
+    bird_calls: list[dict] | None = None,
+    taxon_rollup: dict[str, dict] | None = None,
+    yamnet_summary: dict | None = None,
+    yamnet_error: str = "",
+) -> dict[str, str | int | float | None]:
     timestamp = from_iso(row["timestamp_utc"]).astimezone(zone).strftime("%Y-%m-%dT%H:%M:%S")
     selected_calls, truncated = _selected_call_cells(bird_calls or [])
     output = {
@@ -241,10 +290,12 @@ def _row_to_csv(row, zone: ZoneInfo, bird_calls: list[dict] | None = None) -> di
         "bird_total_calls": row["bird_total_calls"] or "",
         "bird_total_species": row["bird_total_species"] or "",
         "bird_top_species": row["bird_top_species"] or "",
+        **_taxon_csv_values(taxon_rollup or {}, prefix="bird_"),
         "bird_shannon_index": _round(row["bird_shannon_index"]),
         "bird_simpson_index": _round(row["bird_simpson_index"]),
         "bird_pielou_evenness": _round(row["bird_pielou_evenness"]),
         **_acoustic_csv_values(row),
+        **_yamnet_csv_values(yamnet_summary or {}, yamnet_error),
         "audio_status": row["audio_status"] or "",
         "bird_calls_truncated": "" if row["system_event"] else truncated,
     }
@@ -257,6 +308,9 @@ def _row_to_june_csv(
     row,
     zone: ZoneInfo,
     bird_calls: list[dict] | None = None,
+    taxon_rollup: dict[str, dict] | None = None,
+    yamnet_summary: dict | None = None,
+    yamnet_error: str = "",
     interval_errors: list[str] | None = None,
     options: CsvExportOptions | None = None,
 ) -> dict[str, str | int | float | None]:
@@ -282,10 +336,12 @@ def _row_to_june_csv(
         "total_calls": row["bird_total_calls"] or "",
         "total_species": row["bird_total_species"] or "",
         "top_species": row["bird_top_species"] or "",
+        **_taxon_csv_values(taxon_rollup or {}, prefix=""),
         "shannon_index": _round(row["bird_shannon_index"]),
         "simpsons_index": _round(row["bird_simpson_index"]),
         "pielou_evenness": _round(row["bird_pielou_evenness"]),
         **_acoustic_csv_values(row),
+        **_yamnet_csv_values(yamnet_summary or {}, yamnet_error),
         "Audio_status": _june_audio_status(row["audio_status"] or ""),
         "": "",
         "Errors": "\n".join(error for error in errors if error),
@@ -363,6 +419,30 @@ def _acoustic_csv_values(row) -> dict[str, str | int | float | None]:
     return output
 
 
+def _taxon_csv_values(rollup: dict[str, dict], prefix: str) -> dict[str, str]:
+    output: dict[str, str] = {}
+    for rank in TAXON_RANKS:
+        key = f"{prefix}top_{rank}"
+        support_key = f"{prefix}top_{rank}_support"
+        item = rollup.get(rank) or {}
+        output[key] = item.get("summary", "")
+        output[support_key] = _round(item.get("support"))
+    return output
+
+
+def _yamnet_csv_values(summary: dict, error: str = "") -> dict[str, str]:
+    output = {
+        "yamnet_top_label": summary.get("top_label", ""),
+        "yamnet_top_score": _round(summary.get("top_score")),
+        "yamnet_top_labels": summary.get("top_labels", ""),
+        "yamnet_error": error,
+    }
+    categories = summary.get("categories", {})
+    for category in YAMNET_CATEGORY_TERMS:
+        output[f"yamnet_{category}_score"] = _round(categories.get(category))
+    return output
+
+
 def _mmhg_to_inhg(value: float | None) -> float | None:
     if value is None:
         return None
@@ -386,6 +466,100 @@ def _bird_call_rows_by_interval(store: DataStore) -> dict[str, list[dict]]:
             }
         )
     return output
+
+
+def _bird_taxon_rollups_by_interval(store: DataStore, species_list_path: str | None) -> dict[str, dict[str, dict]]:
+    calls: dict[tuple[str, int], list] = {}
+    for row in store.list_bird_call_candidates():
+        key = (row["period_start_utc"], int(row["call_index"]))
+        calls.setdefault(key, []).append(row)
+
+    interval_rank_scores: dict[str, dict[str, dict[str, list[float]]]] = {}
+    for (period_start_utc, _call_index), candidates in calls.items():
+        for rank in TAXON_RANKS:
+            scores: dict[str, float] = {}
+            for candidate in candidates:
+                taxon = resolve_taxon(candidate["species"], species_list_path)
+                label = taxon_rank_value(taxon, rank)
+                if not label:
+                    continue
+                confidence = candidate["confidence"] if candidate["confidence"] is not None else 0.0
+                scores[label] = scores.get(label, 0.0) + float(confidence)
+            if not scores:
+                continue
+            label, support = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[0]
+            capped_support = min(1.0, support)
+            interval_rank_scores.setdefault(period_start_utc, {}).setdefault(rank, {}).setdefault(label, []).append(
+                capped_support
+            )
+
+    output: dict[str, dict[str, dict]] = {}
+    for period_start_utc, ranks in interval_rank_scores.items():
+        output[period_start_utc] = {}
+        for rank, label_scores in ranks.items():
+            label, supports = sorted(
+                label_scores.items(),
+                key=lambda item: (-len(item[1]), -(sum(item[1]) / len(item[1]) if item[1] else 0.0), item[0]),
+            )[0]
+            avg_support = sum(supports) / len(supports) if supports else None
+            output[period_start_utc][rank] = {
+                "label": label,
+                "calls": len(supports),
+                "support": avg_support,
+                "summary": _format_taxon_summary(label, len(supports), avg_support),
+            }
+    return output
+
+
+def _format_taxon_summary(label: str, calls: int, support: float | None) -> str:
+    if support is None:
+        return f"{label}(Calls: {calls})"
+    return f"{label}(Calls: {calls}, Support: {support * 100:.1f}%)"
+
+
+def _yamnet_summaries_by_interval(store: DataStore) -> dict[str, dict]:
+    if not hasattr(store, "list_sound_detections"):
+        return {}
+    grouped: dict[str, list] = {}
+    for row in store.list_sound_detections():
+        if row["source"] != "yamnet":
+            continue
+        grouped.setdefault(row["period_start_utc"], []).append(row)
+
+    output: dict[str, dict] = {}
+    for period_start_utc, rows in grouped.items():
+        rows = sorted(rows, key=lambda item: (int(item["rank"]), -(item["score"] or 0.0), item["label"]))
+        categories = {category: 0.0 for category in YAMNET_CATEGORY_TERMS}
+        labels = []
+        for row in rows:
+            score = row["score"]
+            if row["category"] in categories:
+                categories[row["category"]] = max(categories[row["category"]], float(score or 0.0))
+            labels.append(_format_sound_label(row["label"], score))
+        first = rows[0] if rows else None
+        output[period_start_utc] = {
+            "top_label": first["label"] if first else "",
+            "top_score": first["score"] if first else None,
+            "top_labels": "; ".join(labels),
+            "categories": categories,
+        }
+    return output
+
+
+def _yamnet_errors_by_interval(store: DataStore) -> dict[str, str]:
+    if not hasattr(store, "list_sound_analysis_errors"):
+        return {}
+    return {
+        row["period_start_utc"]: row["error"]
+        for row in store.list_sound_analysis_errors()
+        if row["source"] == "yamnet"
+    }
+
+
+def _format_sound_label(label: str, score: float | None) -> str:
+    if score is None:
+        return label
+    return f"{label} ({score * 100:.1f}%)"
 
 
 def _errors_by_interval(store: DataStore) -> dict[str, list[str]]:

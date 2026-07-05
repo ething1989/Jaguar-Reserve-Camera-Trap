@@ -35,6 +35,7 @@ from .config import CameraModeConfig, StationConfig, is_night
 from .csv_exporter import CsvExportOptions, export_day_csv
 from .paths import StationPaths, resolve_paths
 from .sensors import MockSensorSuite, SensorSuite, read_cpu_temp
+from .sound import MockYamNetRunner, YAMNET_SOURCE, YamNetRunner
 from .species_pack import write_active_species_list
 from .storage import DataStore, SensorSample, from_iso, to_utc_iso, utc_now
 from .timekeeper import TimeKeeper
@@ -78,6 +79,7 @@ class StationService:
         self.camera = create_camera(config.camera, mock=hardware_mock)
         self.flash = create_flash(config.camera, mock=hardware_mock)
         self.birdnet = MockBirdNetRunner() if mock else BirdNetRunner(config.birdnet, config.location)
+        self.yamnet = MockYamNetRunner() if mock else YamNetRunner(config.yamnet)
         self.speciesnet = MockSpeciesNetRunner() if mock else SpeciesNetRunner(config.speciesnet, config.location)
         self._capture_lock = Lock()
         self._ai_lock = Lock()
@@ -443,6 +445,7 @@ class StationService:
             latitude=self._current_latitude,
             longitude=self._current_longitude,
             interval_seconds=self.config.schedule.interval_seconds,
+            birdnet_species_list_path=self.config.birdnet.species_list_path,
         )
 
     def _prepare_dynamic_coordinates_and_species(self, log_non_gps_event: bool = True) -> set[date_type]:
@@ -762,6 +765,13 @@ class StationService:
             LOGGER.warning("Acoustic index calculation failed for %s: %s", audio_path, exc, exc_info=True)
             indices = AcousticIndexResult.from_error(str(exc))
         self.store.save_acoustic_indices(period_start, indices)
+        if self.config.yamnet.enabled or self.mock:
+            try:
+                summary = self.yamnet.analyze_audio(audio_path)
+                self.store.save_sound_detections(period_start, YAMNET_SOURCE, summary.detections)
+            except Exception as exc:
+                LOGGER.warning("YAMNet analysis failed for %s: %s", audio_path, exc, exc_info=True)
+                self.store.save_sound_analysis_error(period_start, YAMNET_SOURCE, str(exc))
 
     def process_audio_event(self, period_start: datetime, audio_path: Path, night: bool) -> None:
         if not audio_path.exists():

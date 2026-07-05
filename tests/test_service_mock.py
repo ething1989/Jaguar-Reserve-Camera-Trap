@@ -13,6 +13,7 @@ from juara_station.config import (
     TimeConfig,
 )
 from juara_station.paths import resolve_paths
+from juara_station.paths import StationPaths
 from juara_station.service import StationService
 
 
@@ -68,3 +69,40 @@ def test_scheduled_photo_is_saved(tmp_path: Path):
     rows = service.store.pending_photo_events()
     assert len(rows) == 1
     assert rows[0]["triggered_at_utc"] == "2026-07-03T13:00:00+00:00"
+
+
+def test_fallback_sync_copies_logs_and_photos_to_usb(tmp_path: Path):
+    config = _mock_config(tmp_path)
+    service = StationService(config, resolve_paths(config.storage), mock=True)
+    fallback_paths = StationPaths(
+        root=tmp_path / "fallback",
+        fallback_root=tmp_path / "fallback",
+        state_root=tmp_path / "state",
+        work_root=tmp_path / "work",
+        recording_root=tmp_path / "recordings",
+        logs_subdir=".",
+        photos_subdir="Photos",
+        fallback_active=True,
+    )
+    usb_paths = StationPaths(
+        root=tmp_path / "usb",
+        fallback_root=tmp_path / "fallback",
+        state_root=tmp_path / "state",
+        work_root=tmp_path / "work",
+        recording_root=tmp_path / "recordings",
+        logs_subdir=".",
+        photos_subdir="Photos",
+        fallback_active=False,
+    )
+    service.paths = fallback_paths
+    fallback_paths.logs_dir.mkdir(parents=True)
+    fallback_paths.photos_dir.mkdir(parents=True)
+    (fallback_paths.logs_dir / "juara_environment_samples.csv").write_text("header\none\ntwo\n")
+    (fallback_paths.photos_dir / "field.jpg").write_bytes(b"photo")
+    usb_paths.logs_dir.mkdir(parents=True, exist_ok=True)
+    (usb_paths.logs_dir / "juara_environment_samples.csv").write_text("header\n")
+
+    service._copy_fallback_outputs_to_usb(usb_paths)
+
+    assert (usb_paths.logs_dir / "juara_environment_samples.csv").read_text() == "header\none\ntwo\n"
+    assert (usb_paths.photos_dir / "field.jpg").read_bytes() == b"photo"

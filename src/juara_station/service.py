@@ -208,27 +208,30 @@ class StationService:
                 refreshed.database_path,
             )
             return
-        self._copy_fallback_media_to_usb(refreshed)
+        self._copy_fallback_outputs_to_usb(refreshed)
         self.paths = refreshed
         self._fallback_storage_since = None
         LOGGER.warning("USB storage became available; station outputs switched to %s", self.paths.root)
 
-    def _copy_fallback_media_to_usb(self, target_paths: StationPaths) -> None:
-        fallback_photos = self.paths.photos_dir
-        if not fallback_photos.exists():
+    def _copy_fallback_outputs_to_usb(self, target_paths: StationPaths) -> None:
+        self._copy_fallback_tree_to_usb(self.paths.photos_dir, target_paths.photos_dir, "media")
+        self._copy_fallback_tree_to_usb(self.paths.logs_dir, target_paths.logs_dir, "logs")
+
+    def _copy_fallback_tree_to_usb(self, source_root: Path, target_root: Path, label: str) -> None:
+        if not source_root.exists() or source_root == target_root:
             return
-        for source in fallback_photos.glob("**/*"):
+        for source in source_root.glob("**/*"):
             if not source.is_file():
                 continue
-            relative = source.relative_to(fallback_photos)
-            target = target_paths.photos_dir / relative
-            if target.exists():
+            relative = source.relative_to(source_root)
+            target = target_root / relative
+            if target.exists() and target.stat().st_size >= source.stat().st_size:
                 continue
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
             except OSError:
-                LOGGER.warning("Unable to copy fallback media file to USB: %s", source, exc_info=True)
+                LOGGER.warning("Unable to copy fallback %s file to USB: %s", label, source, exc_info=True)
 
     def _record_time_source_errors(self, period_start: datetime, reading) -> None:
         if reading.source == "estimated":

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -u
 
+if [ -f /etc/default/juara-networkpi-maintenance ]; then
+  # shellcheck disable=SC1091
+  . /etc/default/juara-networkpi-maintenance
+fi
+
 LOG_PATH="${JUARA_NETWORKPI_LOG:-/var/log/juara-networkpi-maintenance.log}"
 TARGET_SSID="${JUARA_NETWORKPI_SSID:-NetworkPi}"
 SERVICE_USER="${JUARA_SERVICE_USER:-juara2026pi1}"

@@ -100,7 +100,9 @@ def test_fallback_sync_copies_logs_and_photos_to_usb(tmp_path: Path):
     fallback_paths.logs_dir.mkdir(parents=True)
     fallback_paths.photos_dir.mkdir(parents=True)
     fallback_paths.survey_photos_dir.mkdir(parents=True)
+    (fallback_paths.logs_dir / "Jaguar Reserve Camera Trap.csv").write_text("main\nrow\n")
     (fallback_paths.logs_dir / "juara_environment_samples.csv").write_text("header\none\ntwo\n")
+    (fallback_paths.logs_dir / "juara_photo_diagnostics.csv").write_text("debug\nrow\n")
     (fallback_paths.photos_dir / "field.jpg").write_bytes(b"photo")
     (fallback_paths.survey_photos_dir / "survey.jpg").write_bytes(b"survey")
     usb_paths.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -108,6 +110,8 @@ def test_fallback_sync_copies_logs_and_photos_to_usb(tmp_path: Path):
 
     service._copy_fallback_outputs_to_usb(usb_paths)
 
-    assert (usb_paths.logs_dir / "juara_environment_samples.csv").read_text() == "header\none\ntwo\n"
+    assert (usb_paths.logs_dir / "Jaguar Reserve Camera Trap.csv").read_text() == "main\nrow\n"
+    assert (usb_paths.logs_dir / "juara_environment_samples.csv").read_text() == "header\n"
+    assert not (usb_paths.logs_dir / "juara_photo_diagnostics.csv").exists()
     assert (usb_paths.photos_dir / "field.jpg").read_bytes() == b"photo"
     assert (usb_paths.survey_photos_dir / "survey.jpg").read_bytes() == b"survey"

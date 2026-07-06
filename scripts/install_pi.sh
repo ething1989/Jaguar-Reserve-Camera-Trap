@@ -394,12 +394,23 @@ mkdir -p \
 rm -rf "$USB_MOUNT/juara/audio" "$USB_MOUNT/juara/media/audio"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$USB_MOUNT/juara" /var/lib/juara-station /tmp/juara-ai-work /tmp/juara-audio 2>/dev/null || true
 
+install -m 0755 "$APP_DIR/scripts/juara_networkpi_maintenance" /usr/local/bin/juara_networkpi_maintenance
+install -m 0755 "$APP_DIR/scripts/juara_git_update" /usr/local/bin/juara_git_update
+install -m 0755 "$APP_DIR/scripts/juara_gdrive_sync" /usr/local/bin/juara_gdrive_sync
+install -m 0755 "$APP_DIR/scripts/juara_gdrive_auth_helper" /usr/local/bin/juara_gdrive_auth_helper
+
 sed "s#__USER__#$SERVICE_USER#g; s#__APP_DIR__#$APP_DIR#g; s#__CONFIG_PATH__#$CONFIG_PATH#g" \
   "$APP_DIR/systemd/juara-station.service.in" > /etc/systemd/system/juara-station.service
 sed "s#__USER__#$SERVICE_USER#g; s#__APP_DIR__#$APP_DIR#g; s#__CONFIG_PATH__#$CONFIG_PATH#g" \
   "$APP_DIR/systemd/juara-ai-worker.service.in" > /etc/systemd/system/juara-ai-worker.service
 install -m 0644 "$APP_DIR/systemd/juara-daily-reboot.service" /etc/systemd/system/juara-daily-reboot.service
 install -m 0644 "$APP_DIR/systemd/juara-daily-reboot.timer" /etc/systemd/system/juara-daily-reboot.timer
+install -m 0644 "$APP_DIR/systemd/juara-networkpi-maintenance.service" /etc/systemd/system/juara-networkpi-maintenance.service
+install -m 0644 "$APP_DIR/systemd/juara-networkpi-maintenance.timer" /etc/systemd/system/juara-networkpi-maintenance.timer
+install -m 0644 "$APP_DIR/systemd/juara-git-update.service" /etc/systemd/system/juara-git-update.service
+install -m 0644 "$APP_DIR/systemd/juara-git-update.timer" /etc/systemd/system/juara-git-update.timer
+install -m 0644 "$APP_DIR/scripts/systemd/juara-wifi-watchdog.service" /etc/systemd/system/juara-wifi-watchdog.service
+install -m 0644 "$APP_DIR/scripts/systemd/juara-wifi-watchdog.timer" /etc/systemd/system/juara-wifi-watchdog.timer
 
 systemctl daemon-reload
 systemctl enable gpsd.socket gpsd.service || true
@@ -407,6 +418,9 @@ systemctl restart gpsd.socket gpsd.service || true
 systemctl enable juara-station.service
 systemctl enable juara-ai-worker.service
 systemctl enable --now juara-daily-reboot.timer
+systemctl enable --now juara-networkpi-maintenance.timer
+systemctl enable --now juara-git-update.timer
+systemctl enable --now juara-wifi-watchdog.timer
 
 "$VENV_PYTHON" - <<'PY' || true
 import importlib.util

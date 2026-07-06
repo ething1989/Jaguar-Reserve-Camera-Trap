@@ -4,7 +4,7 @@ from pathlib import Path
 from juara_station.species_pack import build_species_list_from_pack, write_active_species_list
 
 
-def test_species_pack_selects_four_nearest_cells_without_regions(tmp_path: Path):
+def test_species_pack_selects_four_nearest_cells_without_region_union(tmp_path: Path):
     pack = tmp_path / "pack"
     (pack / "metadata").mkdir(parents=True)
     (pack / "cells").mkdir()
@@ -30,11 +30,21 @@ def test_species_pack_selects_four_nearest_cells_without_regions(tmp_path: Path)
     }.items():
         (pack / "cells" / f"{name}.txt").write_text(species)
 
+    (pack / "regions").mkdir()
+    (pack / "metadata" / "region_index.csv").write_text(
+        "key,title,description,lat_min,lat_max,lon_min,lon_max,bbox_wraps_dateline,cell_count,species_count,species_file,counts_file\n"
+        "world,World,Global,-90,90,-180,180,False,999,10,regions/world.txt,regions/world_counts.tsv\n"
+        "amazon_rainforest,Amazon Rainforest,Specific,-20,9,-82,-45,False,42,1,regions/amazon_rainforest.txt,regions/amazon_rainforest_counts.tsv\n"
+    )
+    (pack / "regions" / "amazon_rainforest.txt").write_text("Too broad bird\n")
+
     species, selection = build_species_list_from_pack(pack, -17.102778, -56.941639, cells_without_region=4)
 
     assert len(selection.cell_files) == 4
+    assert selection.region_key == "amazon_rainforest"
     assert selection.cell_files == ("cells/a.txt", "cells/b.txt", "cells/c.txt", "cells/d.txt")
     assert "Species one" in species
+    assert "Too broad bird" not in species
     assert "Cell E bird" not in species
 
 

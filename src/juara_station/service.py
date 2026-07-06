@@ -33,6 +33,7 @@ from .audio import AudioRecorder, MockAudioRecorder
 from .camera import MotionWatcher, create_camera, create_flash
 from .config import CameraModeConfig, StationConfig, is_night
 from .csv_exporter import CsvExportOptions, export_day_csv
+from .geolocation import DEFAULT_GEOLOCATION_URLS, read_internet_location
 from .paths import StationPaths, resolve_paths
 from .perch import MockPerchRunner, PERCH_SOURCE, PerchRunner
 from .sensors import MockSensorSuite, SensorSuite, read_cpu_temp
@@ -477,6 +478,7 @@ class StationService:
         event = {
             "gps": "GPS_COORDINATES",
             "past": "PAST_COORDINATES",
+            "internet": "INTERNET_COORDINATES",
             "fallback": "FALLBACK_COORDINATES",
         }.get(source, "FALLBACK_COORDINATES")
         if source == "gps" or log_non_gps_event:
@@ -575,8 +577,28 @@ class StationService:
             latitude, longitude = previous
             return latitude, longitude, "past", "GPS unavailable; using last accepted field coordinates"
 
+        internet = self._read_internet_coordinates()
+        if internet is not None:
+            latitude, longitude, note = internet
+            self._write_coordinate_state(latitude, longitude, "internet")
+            return latitude, longitude, "internet", note
+
         self._write_coordinate_state(fallback[0], fallback[1], "fallback")
         return fallback[0], fallback[1], "fallback", "GPS unavailable; using backup deployment coordinates"
+
+    def _read_internet_coordinates(self) -> tuple[float, float, str] | None:
+        if not self.config.time.internet_coordinate_enabled:
+            return None
+        urls = self.config.time.internet_coordinate_urls or list(DEFAULT_GEOLOCATION_URLS)
+        location = read_internet_location(urls, timeout_seconds=self.config.time.internet_coordinate_timeout_seconds)
+        if location is None:
+            return None
+        label = f" ({location.label})" if location.label else ""
+        return (
+            location.latitude,
+            location.longitude,
+            f"GPS unavailable; using internet setup coordinates from {location.source_url}{label}",
+        )
 
     def _coordinate_state_path(self) -> Path:
         return self.paths.state_dir / "active_coordinates.json"

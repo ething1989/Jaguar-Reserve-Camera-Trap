@@ -109,11 +109,16 @@ rtc_write_enabled = true
 large_drift_minutes = 5.0
 small_drift_minutes = 1.0
 gps_large_drift_sync_count = 3
+fallback_latitude = -17.102778
+fallback_longitude = -56.941639
+species_pack_root = "/opt/juara-wildlife-station/data/BirdNET_Global_Species_Packs"
+active_species_list_path = "/var/lib/juara-station/state/juara-birdnet-species-list.txt"
 
 [birdnet]
 enabled = true
 backend = "birdnet"
-species_list_path = "/etc/juara-birdnet-species-list.txt"
+species_list_path = "/var/lib/juara-station/state/juara-birdnet-species-list.txt"
+species_filter_mode = "generated_list"
 run_in_station_service = false
 use_subprocess = false
 prewarm_at_start = true
